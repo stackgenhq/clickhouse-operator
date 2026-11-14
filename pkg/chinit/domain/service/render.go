@@ -524,34 +524,53 @@ func (b *Boot) healthGate(ctx context.Context) error {
 		return nil
 	}
 	if err != nil && b.Spec.Role != model.RoleBackup {
-		// The replicas/tables checks failed: peers may still be coming
-		// up (a fleet roll or a keeper restart mid-boot). Re-join via
-		// the same schema-sync the hourly timer runs, then re-check.
-		for attempt := 1; attempt <= healthRetryAttempts && ctx.Err() == nil; attempt++ {
-			fmt.Fprintf(os.Stderr, "health gate degraded (attempt %d/%d): retrying schema-sync before the final verdict\n",
-				attempt, healthRetryAttempts)
-			if serr := b.gateSchemaSync(ctx); serr != nil {
-				fmt.Fprintf(os.Stderr, "WARNING: health-gate schema-sync retry failed: %v\n", serr)
-			}
-			select {
-			case <-time.After(healthRetryBackoff):
-			case <-ctx.Done():
-			}
-			report, err = b.runHealthCheck(ctx)
-			if report != nil {
-				fmt.Fprintf(os.Stderr, "cluster health verdict (retry %d):\n%s\n", attempt, report.FormatHuman())
-			}
-			if err == nil {
-				return nil
-			}
-		}
-		return fmt.Errorf("post-boot cluster health check still degraded after %d schema-sync retries (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w",
-			healthRetryAttempts, err)
+		return b.retryGate(ctx, err)
+	}
+	// Degraded reports come back with err == nil (Check's contract:
+	// the report IS the finding, never an error) — the retry must key
+	// on the report's status or a zombie reader (empty schema, peers
+	// unreachable at first probe) sails through the gate on its FIRST
+	// degraded verdict without ever running the schema-sync heal (the
+	// live 0.2.4 finding: one verdict line, zero retries).
+	if report != nil && !report.Healthy() && b.Spec.Role != model.RoleBackup && !b.Refresh {
+		return b.retryGate(ctx, fmt.Errorf("health report degraded: %s", report.Status))
 	}
 	if err != nil {
 		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w", err)
 	}
 	return nil
+}
+
+// retryGate runs the health gate's bounded schema-sync + re-probe loop
+// (shared by the error path and the degraded-report path).
+func (b *Boot) retryGate(ctx context.Context, firstErr error) error {
+	err := firstErr
+	for attempt := 1; attempt <= healthRetryAttempts && ctx.Err() == nil; attempt++ {
+		fmt.Fprintf(os.Stderr, "health gate degraded (attempt %d/%d): retrying schema-sync before the final verdict\n",
+			attempt, healthRetryAttempts)
+		if serr := b.gateSchemaSync(ctx); serr != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: health-gate schema-sync retry failed: %v\n", serr)
+		}
+		select {
+		case <-time.After(healthRetryBackoff):
+		case <-ctx.Done():
+		}
+		report, rerr := b.runHealthCheck(ctx)
+		if report != nil {
+			fmt.Fprintf(os.Stderr, "cluster health verdict (retry %d):\n%s\n", attempt, report.FormatHuman())
+		}
+		// Success is a HEALTHY report, not a nil error: the degraded
+		// path must keep healing until the verdict clears or the
+		// attempts run out.
+		if rerr == nil && report != nil && report.Healthy() {
+			return nil
+		}
+		if rerr != nil {
+			err = rerr
+		}
+	}
+	return fmt.Errorf("post-boot cluster health check still degraded after %d schema-sync retries (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w",
+		healthRetryAttempts, err)
 }
 
 // healthRetryAttempts/backoff bound the health-gate self-healing loop:
