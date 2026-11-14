@@ -154,6 +154,8 @@ var _ = Describe("runDiskAutoscale", func() {
 	var fakes *diskAutoscaleFakes
 	var statePath string
 
+	var probedArgs [][]string
+
 	seed := func(freeGB float64) {
 		fakes = &diskAutoscaleFakes{runner: &fakeRunner{}}
 		identity := model.NodeIdentity{
@@ -171,9 +173,17 @@ var _ = Describe("runDiskAutoscale", func() {
 		fakes.pusher = &fakeMetricPusher{}
 		fakes.provider = &diskAutoscaleProvider{name: "aws", grower: fakes.grower, pusher: fakes.pusher}
 
+		// The admin password file seam (the probe's credential source).
+		passwordPath := filepath.Join(diskAutoscaleDir, "admin-password")
+		Expect(os.WriteFile(passwordPath, []byte("sekrit\n"), 0644)).To(Succeed())
+		origPassword := adminPasswordPath
+		adminPasswordPath = func() string { return passwordPath }
+		DeferCleanup(func() { adminPasswordPath = origPassword })
+
 		origRun := runCommand
 		origBuild := buildProvider
 		runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			probedArgs = append(probedArgs, args)
 			// The free-space probe: return the seeded bytes.
 			return []byte(strconv.FormatInt(int64(freeGB*(1<<30)), 10)), nil
 		}
@@ -191,6 +201,17 @@ var _ = Describe("runDiskAutoscale", func() {
 		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
 		Expect(fakes.grower.grew).To(BeEmpty())
 		Expect(fakes.grower.described).To(BeEmpty())
+
+		// The probe must authenticate as admin with the password file's
+		// value — the bare client's `default` user is refused outright
+		// (the live 0.2.4 finding: every timer start failed on
+		// AUTHENTICATION_FAILED until the credentials were threaded).
+		Expect(probedArgs).NotTo(BeEmpty())
+		probe := probedArgs[0]
+		Expect(probe).To(ContainElement("--user"))
+		Expect(probe).To(ContainElement("admin"))
+		Expect(probe).To(ContainElement("--password"))
+		Expect(probe).To(ContainElement("sekrit"))
 	})
 
 	It("grows the volume and resizes the filesystem below the floor", func() {

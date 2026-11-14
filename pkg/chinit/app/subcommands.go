@@ -767,9 +767,19 @@ func runDiskAutoscale(args []string) error {
 }
 
 // diskEffectiveFree queries the local server for the default disk's
-// effective free bytes (after keep_free_space).
+// effective free bytes (after keep_free_space). The admin password
+// file is the credential source — the bare client defaults to the
+// `default` user, whose profile is readonly on this stack and whose
+// connection is refused outright when a password is configured
+// (AUTHENTICATION_FAILED — the live 0.2.4 finding: the probe ran
+// before the password was threaded and every timer start failed).
 func diskEffectiveFree(ctx context.Context) (uint64, error) {
-	out, err := runCommand(ctx, "clickhouse-client", "--query", diskFreeQuery)
+	args := []string{"--user", "admin"}
+	if pw := adminPassword(); pw != "" {
+		args = append(args, "--password", pw)
+	}
+	args = append(args, "--query", diskFreeQuery)
+	out, err := runCommand(ctx, "clickhouse-client", args...)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}
