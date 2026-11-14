@@ -85,14 +85,29 @@ func (b *Boot) chinitUnits() []system.UnitFile {
 	var units []system.UnitFile
 	switch b.Spec.Role {
 	case model.RoleKeeper:
+		// Self-healing: keeper-health runs every minute (the bash-era
+		// cron's cadence) — keeper_up datapoints older than 2 periods
+		// are exactly what keeper_down's evaluation window keys on. The
+		// 2026-11-13 blind window: the service installed without its
+		// timer, so the probe never ran again after boot.
 		units = append(units,
 			b.chinitUnit("keeper-health.service", "ClickHouse Keeper ensemble health probe", "keeper-health"),
+			chinitTimer("keeper-health.timer", "Probe keeper health and publish keeper_up every minute", "*-*-* *:*:00"),
 		)
 	case model.RoleWriter, model.RoleReader:
 		units = append(units,
 			b.chinitUnit("replica-sync.service", "Post-boot replica synchronization (SYSTEM SYNC REPLICA)", "replica-sync"),
 			b.chinitUnit("schema-sync.service", "ClickHouse schema auto-propagation from cluster peers", "schema-sync -retries 3 -prune-stale-self"),
 			chinitTimer("schema-sync.timer", "Run schema sync periodically", "hourly"),
+			// Self-healing disk headroom: effective free below the
+			// floor (the keep_free_space-aware number merges gate on)
+			// grows the node's own volume + filesystem online. The
+			// 2026-11-14 incident ran with ~1 MiB effective while df
+			// said 30% free — parts exploded to 1800+ before a human
+			// grew the volume by hand. Five minutes is the merge-stall
+			// early-warning cadence: parts climb ~10/5min at ingest.
+			b.chinitUnit("disk-autoscale.service", "Data-disk headroom keeper (online volume + fs growth)", "disk-autoscale"),
+			chinitTimer("disk-autoscale.timer", "Check data-disk headroom every 5 minutes", "*-*-* *:00/5:00"),
 		)
 		// Identity-mode gate, never a role gate: the ordinal lease is
 		// claimed by BOTH ASG roles (writers since the writer-ASG
@@ -375,8 +390,21 @@ func (b *Boot) cloudWatchConfig(role model.Role, cluster string) cloudWatchConfi
 	// operator's alert-catalog thresholds key on these. Keepers have no
 	// server logs and servers no keeper logs; pointing the agent at
 	// files a role cannot exist with makes it retry forever.
+	//
+	// Self-healing additions (the 2026-11-14 incident's blind alarms):
+	//   - ClickHouseMetrics_DelayedInserts feeds the
+	//     writer-insert-backpressure alarm — it sat INSUFFICIENT_DATA
+	//     since creation because the selector omitted it.
+	//   - ClickHouseMetrics_Merge is the merge-drain signal: parts can
+	//     pile up with zero merges running (the disk-full stall) and
+	//     neither CPU nor parts-count shows WHY.
+	//   - ClickHouseAsyncMetrics_DiskAvailable{disk} is the effective
+	//     free space (volume minus keep_free_space) — the 32 GiB volume
+	//     with a 10 GiB reservation left ~1 MiB effective while df
+	//     showed 30% free; the disk-level alarm must key on the
+	//     metric ClickHouse itself refuses writes at.
 	chNamespace := "ClickHouse/Server"
-	metricSelectors := `^ClickHouse(AsyncMetrics_)?(Uptime|ReplicasMaxAbsoluteDelay|MaxPartCountForPartition)$|^ClickHouseMetrics_(ReadonlyReplica|DistributedFilesToInsert|Query)$`
+	metricSelectors := `^ClickHouse(AsyncMetrics_)?(Uptime|ReplicasMaxAbsoluteDelay|MaxPartCountForPartition)$|^ClickHouseMetrics_(ReadonlyReplica|DistributedFilesToInsert|Query|DelayedInserts|Merge)$|^ClickHouseAsyncMetrics_Disk(Available|Total|Used)$`
 	logEntries := `,
                     {
                         "file_path": "/var/log/clickhouse-server/clickhouse-server.log",
@@ -449,7 +477,7 @@ scrape_configs:
                             "source_labels": ["job"],
                             "label_matcher": "^clickhouse$",
                             "metric_selectors": ["` + metricSelectors + `"],
-                            "dimensions": [["ClusterName", "NodeType"], ["ClusterName"]]
+                            "dimensions": [["ClusterName", "NodeType"], ["ClusterName"], ["ClusterName", "disk"], ["ClusterName", "NodeType", "disk"]]
                         }
                     ]
                 }

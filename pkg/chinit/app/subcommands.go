@@ -569,10 +569,19 @@ var buildProvider = func(cloud string, region string) (port.Provider, error) {
 	return registry().Build(cloud, port.Config{Region: region})
 }
 
-// runKeeperHealth is `chinit keeper-health` (keepers' cron): the
+// runKeeperHealth is `chinit keeper-health` (keepers' timer): the
 // ensemble health probe (mntr four-letter word over the keeper port).
-// Localhost is the settled contract: the cron runs ON the keeper it
+// Localhost is the settled contract: the job runs ON the keeper it
 // reports about.
+//
+// Self-healing contract: the probe result is pushed to CloudWatch as
+// keeper_up (1/0) with the Cluster dimension — the keeper_down alarm's
+// exact key. The bash-era cron did this via `aws cloudwatch
+// put-metric-data`; the chinit cutover dropped the push and the alarm
+// sat INSUFFICIENT_DATA blind for days (the 2026-11-13 finding). The
+// mntr exit status stays authoritative: a push failure is a loud
+// WARNING, never a probe failure, so a metrics-API blip can't make a
+// healthy keeper look down.
 func runKeeperHealth(args []string) error {
 	statePath, err := statePathFlag(args)
 	if err != nil {
@@ -589,10 +598,271 @@ func runKeeperHealth(args []string) error {
 		Timeout: 30 * time.Second,
 	})
 	fmt.Fprintln(os.Stderr, out)
-	if err != nil {
-		_ = st // identity already validated by the load
+
+	up := 0.0
+	if err == nil {
+		up = 1.0
 	}
+	pushKeeperUp(ctx, st, up)
 	return err
+}
+
+// pushKeeperUp publishes the keeper_up datapoint through the
+// provider's MetricPusher capability (absent → log-only degradation).
+func pushKeeperUp(ctx context.Context, st *nodeState, up float64) {
+	provider, perr := buildProvider(providerNameOf(st), st.Identity.Region)
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: keeper-health cannot build provider for metric push: %v\n", perr)
+		return
+	}
+	pusher := port.AsMetricPusher(provider)
+	if pusher == nil {
+		fmt.Fprintf(os.Stderr, "WARNING: provider %s has no metric-push capability; keeper_up not published (alarm %s-keeper-down will stay INSUFFICIENT_DATA)\n",
+			providerNameOf(st), st.clusterName())
+		return
+	}
+	perr = pusher.PutMetric(ctx, port.MetricPushRequest{
+		Namespace:  "ClickHouse/Keeper",
+		Name:       "keeper_up",
+		Value:      up,
+		Unit:       "Count",
+		Dimensions: map[string]string{"Cluster": st.clusterName()},
+	})
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: keeper_up push failed (probe result stands): %v\n", perr)
+	}
+}
+
+// diskAutoscaleConfig bounds the disk-autoscale job. The floor keys
+// on EFFECTIVE free space — what system.disks.free_space reports after
+// the keep_free_space reservation — because that is the number
+// ClickHouse refuses writes at (df shows the pre-reservation view and
+// lies by the reservation size: the 2026-11-14 incident had 30% free
+// in df and ~1 MiB effective).
+type diskAutoscaleConfig struct {
+	// FloorGB is the effective-free threshold that triggers growth.
+	FloorGB float64
+	// GrowthGB is the increment per grow event.
+	GrowthGB float64
+	// MaxGB is the ceiling (a runaway job must never grow a volume
+	// past the account's cost envelope).
+	MaxGB float64
+	// DataDiskDevice is the EC2 attachment device of the data volume.
+	DataDiskDevice string
+	// DataMountPoint is where the data disk is mounted (ext4 resize
+	// target; NVMe names map from the device at runtime).
+	DataMountPoint string
+}
+
+// defaultDiskAutoscaleConfig is sized for the metadata-disk role:
+// headroom for one day of part-catalog churn at ingest, capped at a
+// 256 GiB envelope. The mount/device defaults are the compute
+// module's launch-template convention (/dev/sdb → /var/lib/clickhouse).
+func defaultDiskAutoscaleConfig() diskAutoscaleConfig {
+	return diskAutoscaleConfig{
+		FloorGB:        8,
+		GrowthGB:       32,
+		MaxGB:          256,
+		DataDiskDevice: "/dev/sdb",
+		DataMountPoint: "/var/lib/clickhouse",
+	}
+}
+
+// diskFreeQuery is the health probe: effective free bytes on the
+// default disk straight from the server (the number the merge engine
+// gates writes on), not df.
+const diskFreeQuery = "SELECT free_space FROM system.disks WHERE name = 'default'"
+
+// runDiskAutoscale is `chinit disk-autoscale` (the writers'/readers'
+// timer): keep effective disk headroom above the floor by growing the
+// node's OWN data volume + filesystem online.
+//
+// Why self-healing: a metadata-disk at its floor stalls merges
+// (NOT_ENOUGH_SPACE on merge output) while inserts keep landing —
+// parts climb until parts_to_throw_insert hard-rejects ingest (the
+// 2026-11-14 incident: 1800+ parts, ~1 MiB effective free). Growth is
+// the one remedy that needs no human and no downtime: gp3 volumes
+// resize live and ext4 grows online. The job is idempotent (a no-op
+// above the floor), bounded (MaxGB), and pushes its outcome to
+// CloudWatch so the alarm side sees what the job did.
+func runDiskAutoscale(args []string) error {
+	statePath, err := statePathFlag(args)
+	if err != nil {
+		return err
+	}
+	st, err := loadNodeState(statePath)
+	if err != nil {
+		return err
+	}
+	cfg := defaultDiskAutoscaleConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	freeBytes, err := diskEffectiveFree(ctx)
+	if err != nil {
+		return fmt.Errorf("disk-autoscale: effective free probe failed: %w", err)
+	}
+	freeGB := float64(freeBytes) / (1 << 30)
+	fmt.Printf("disk-autoscale: effective free %.2f GiB (floor %.0f GiB)\n", freeGB, cfg.FloorGB)
+
+	if freeGB >= cfg.FloorGB {
+		return nil
+	}
+
+	provider, perr := buildProvider(providerNameOf(st), st.Identity.Region)
+	if perr != nil {
+		return fmt.Errorf("disk-autoscale: build provider: %w", perr)
+	}
+	grower := port.AsVolumeGrower(provider)
+	if grower == nil {
+		// Pressure found, remedy absent: publish the finding (the
+		// alarm side keys on the metric) and fail loudly — the node
+		// IS degraded, and a silent skip is how blind spots form.
+		pushDiskPressure(ctx, st, freeGB, false)
+		return fmt.Errorf("disk-autoscale: effective free %.2f GiB below floor but provider %s cannot grow volumes", freeGB, providerNameOf(st))
+	}
+
+	vol, verr := grower.DescribeOwnVolume(ctx, port.VolumeGrowRequest{
+		InstanceID: instanceIDOf(st),
+		Device:     cfg.DataDiskDevice,
+	})
+	if verr != nil {
+		pushDiskPressure(ctx, st, freeGB, false)
+		return fmt.Errorf("disk-autoscale: find data volume: %w", verr)
+	}
+	target := int32(float64(vol.SizeGB) + cfg.GrowthGB)
+	if float64(target) > cfg.MaxGB {
+		target = int32(cfg.MaxGB)
+	}
+	if target <= vol.SizeGB {
+		pushDiskPressure(ctx, st, freeGB, false)
+		return fmt.Errorf("disk-autoscale: effective free %.2f GiB below floor but volume %s already at the %d GiB ceiling", freeGB, vol.VolumeID, int32(cfg.MaxGB))
+	}
+
+	grew, gerr := grower.GrowVolume(ctx, vol.VolumeID, target)
+	if gerr != nil {
+		pushDiskPressure(ctx, st, freeGB, false)
+		return fmt.Errorf("disk-autoscale: grow %s to %d: %w", vol.VolumeID, target, gerr)
+	}
+	if grew {
+		if werr := grower.WaitForModification(ctx, vol.VolumeID); werr != nil {
+			// The modification is in flight server-side; the fs step
+			// below simply finds nothing to do and the NEXT timer run
+			// completes it (the job is idempotent by design).
+			fmt.Fprintf(os.Stderr, "WARNING: disk-autoscale: modification wait ended early: %v\n", werr)
+		}
+	}
+
+	if serr := growFilesystem(ctx, cfg); serr != nil {
+		// The volume grew (billed) but the fs didn't follow: publish
+		// the outcome and surface the error — the next run retries the
+		// fs step only (grow is a no-op at target).
+		pushDiskPressure(ctx, st, freeGB, true)
+		return fmt.Errorf("disk-autoscale: volume at %d GiB but filesystem resize failed: %w", target, serr)
+	}
+
+	fmt.Printf("disk-autoscale: grew %s to %d GiB and resized the filesystem\n", vol.VolumeID, target)
+	pushDiskPressure(ctx, st, float64(freeBytes)/(1<<30), true)
+	return nil
+}
+
+// diskEffectiveFree queries the local server for the default disk's
+// effective free bytes (after keep_free_space).
+func diskEffectiveFree(ctx context.Context) (uint64, error) {
+	out, err := runCommand(ctx, "clickhouse-client", "--query", diskFreeQuery)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse free_space %q: %w", strings.TrimSpace(string(out)), err)
+	}
+	return v, nil
+}
+
+// growFilesystem extends the ext4 filesystem to the grown device.
+// NVMe rescan first: the kernel caches the block device's size, and
+// the fresh capacity is invisible to resize2fs until the controller
+// re-reads it (the live 2026-11-14 finding — /sys/block saw 64 GiB
+// while resize2fs still read the stale 32 GiB fd).
+func growFilesystem(ctx context.Context, cfg diskAutoscaleConfig) error {
+	dev, err := resolveNVMeDevice(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	// Controller rescan (best-effort): /sys/class/nvme/<ctrl>/device/rescan.
+	if ctrl := nvmeControllerOf(dev); ctrl != "" {
+		_, _ = runCommand(ctx, "sh", "-c", "echo 1 > /sys/class/nvme/"+ctrl+"/device/rescan")
+	}
+	if out, err := runCommand(ctx, "resize2fs", dev); err != nil {
+		return fmt.Errorf("resize2fs %s: %s", dev, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// resolveNVMeDevice finds the block device backing the mount point.
+func resolveNVMeDevice(ctx context.Context, cfg diskAutoscaleConfig) (string, error) {
+	out, err := runCommand(ctx, "findmnt", "-n", "-o", "SOURCE", cfg.DataMountPoint)
+	if err != nil {
+		return "", fmt.Errorf("findmnt %s: %s", cfg.DataMountPoint, strings.TrimSpace(string(out)))
+	}
+	dev := strings.TrimSpace(string(out))
+	if dev == "" {
+		return "", fmt.Errorf("no block device mounted at %s", cfg.DataMountPoint)
+	}
+	return dev, nil
+}
+
+// nvmeControllerOf extracts the nvme controller name ("nvme1") from a
+// block device path ("/dev/nvme1n1"); "" when not NVMe.
+func nvmeControllerOf(dev string) string {
+	base := strings.TrimPrefix(dev, "/dev/")
+	if i := strings.Index(base, "n1"); i > 0 && strings.HasPrefix(base, "nvme") {
+		return base[:i]
+	}
+	return ""
+}
+
+// instanceIDOf extracts the EC2 instance id from the identity (the
+// AWS provider stores it with an i- prefix).
+func instanceIDOf(st *nodeState) string {
+	return st.Identity.InstanceID
+}
+
+// pushDiskPressure publishes the job outcome: disk_effective_free_gb
+// (the gauge the alarm side keys on) and disk_autoscaled (1 when this
+// run grew the volume). The push is best-effort — the stdout/stderr
+// record stands even when CloudWatch is the broken thing.
+func pushDiskPressure(ctx context.Context, st *nodeState, freeGB float64, grew bool) {
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
+	if err != nil {
+		return
+	}
+	pusher := port.AsMetricPusher(provider)
+	if pusher == nil {
+		return
+	}
+	dims := map[string]string{
+		"ClusterName": st.clusterName(),
+		"NodeType":    string(st.Identity.Role),
+		"Host":        st.Identity.Hostname,
+	}
+	_ = pusher.PutMetric(ctx, port.MetricPushRequest{
+		Namespace:  "ClickHouse/SelfHeal",
+		Name:       "DiskEffectiveFreeGB",
+		Value:      freeGB,
+		Unit:       "Count",
+		Dimensions: dims,
+	})
+	if grew {
+		_ = pusher.PutMetric(ctx, port.MetricPushRequest{
+			Namespace:  "ClickHouse/SelfHeal",
+			Name:       "DiskAutoscaled",
+			Value:      1,
+			Unit:       "Count",
+			Dimensions: dims,
+		})
+	}
 }
 
 // runDeadReplicaGc is `chinit dead-replica-gc` (the weekly timer on

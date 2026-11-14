@@ -153,6 +153,86 @@ type SpotSignals interface {
 	Watch(ctx context.Context) <-chan InterruptionNotice
 }
 
+// MetricPushRequest is one custom metric datapoint (the self-healing
+// jobs' CloudWatch handshake — keeper_up, disk-autoscale outcomes).
+type MetricPushRequest struct {
+	// Namespace is the CloudWatch namespace ("ClickHouse/Keeper").
+	Namespace string
+	// Name is the metric name ("keeper_up").
+	Name string
+	// Value is the datapoint.
+	Value float64
+	// Unit is the CloudWatch unit enum string ("None", "Count", ...).
+	Unit string
+	// Dimensions are the EMF-style dimension pairs the alarms key on.
+	// The alarm's dimensions must be a SUBSET of these.
+	Dimensions map[string]string
+}
+
+// MetricPusher is the optional capability for chinit's self-healing
+// jobs to publish their own liveness/outcome metrics.
+//
+// Why a port: the bash-era keeper-health cron piped `aws cloudwatch
+// put-metric-data` directly; the chinit cutover dropped the push and
+// keeper_down sat INSUFFICIENT_DATA blind for days (the 2026-11-13
+// finding). A capability (probed via AsMetricPusher) keeps the healthy
+// degradation: a provider without a metrics API logs a loud warning
+// and the job still exits 0 — the probe result, not the push, is the
+// health signal.
+type MetricPusher interface {
+	// PutMetric publishes one datapoint. Transient failures are the
+	// caller's to retry (jobs run on timers); a missing capability is
+	// NOT an error — probe first.
+	PutMetric(ctx context.Context, req MetricPushRequest) error
+}
+
+// VolumeInfo is the discovered state of one attached volume.
+type VolumeInfo struct {
+	// VolumeID is the provider's volume identifier.
+	VolumeID string
+	// SizeGB is the current capacity.
+	SizeGB int32
+	// AttachedTo is the instance the volume serves.
+	AttachedTo string
+}
+
+// VolumeGrowRequest names the volume to grow and the target size.
+type VolumeGrowRequest struct {
+	// InstanceID is THIS node's instance identifier (the grower
+	// double-gates ownership: it only ever returns volumes attached
+	// to this instance).
+	InstanceID string
+	// Device is the attachment device path ("/dev/sdb" — the data
+	// disk by launch-template convention).
+	Device string
+	// TargetSizeGB is the desired capacity; a no-op when the volume
+	// is already at or beyond it.
+	TargetSizeGB int32
+}
+
+// VolumeGrower is the optional capability for online data-volume
+// growth — the disk-autoscale job's cloud seam.
+//
+// Why a port: the 2026-11-14 incident ran with ~1 MiB effective free
+// (a 32 GiB volume under a 10 GiB keep_free_space reservation) —
+// merges hit NOT_ENOUGH_SPACE, parts climbed past 1800 and inserts
+// were minutes from the parts_to_throw_insert hard reject. Growing an
+// EBS volume is non-disruptive and idempotent, but the cloud call is
+// provider-specific (EC2 ModifyVolume vs Azure managed-disk resize),
+// so the job keys on the capability: absent → loud warning, the job
+// still reports the pressure it found (the alarm-side signal).
+type VolumeGrower interface {
+	// DescribeOwnVolume returns the volume attached to this instance
+	// at the device, or an error when none exists.
+	DescribeOwnVolume(ctx context.Context, req VolumeGrowRequest) (*VolumeInfo, error)
+	// GrowVolume extends the volume to the request's target and
+	// returns whether a modification actually started.
+	GrowVolume(ctx context.Context, volumeID string, targetSizeGB int32) (bool, error)
+	// WaitForModification blocks until the in-flight modification
+	// completes (the caller owns the deadline).
+	WaitForModification(ctx context.Context, volumeID string) error
+}
+
 // Provider is the factory product: the mandatory capabilities every
 // cloud implements, plus the chctl SecretSource (passwords/TLS — the
 // same port chctl already uses, so one adapter serves both binaries).
@@ -191,6 +271,27 @@ func AsDNSRegistrar(p Provider) DNSRegistrar {
 // AsSpotSignals returns the interruption-watch capability, or nil.
 func AsSpotSignals(p Provider) SpotSignals {
 	if c, ok := p.(SpotSignals); ok {
+		return c
+	}
+	return nil
+}
+
+// AsMetricPusher returns the metric-publish capability, or nil. The
+// self-healing jobs degrade to log-only when absent (the keeper's
+// mntr exit status remains authoritative even when the push cannot
+// happen).
+func AsMetricPusher(p Provider) MetricPusher {
+	if c, ok := p.(MetricPusher); ok {
+		return c
+	}
+	return nil
+}
+
+// AsVolumeGrower returns the online volume-growth capability, or nil.
+// The disk-autoscale job degrades to alarm-only when absent (the
+// pressure it found is still reported through the health metric).
+func AsVolumeGrower(p Provider) VolumeGrower {
+	if c, ok := p.(VolumeGrower); ok {
 		return c
 	}
 	return nil

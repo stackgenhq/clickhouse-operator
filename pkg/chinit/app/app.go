@@ -79,6 +79,8 @@ func Run(args []string) error {
 		return runLeaseRenew(rest)
 	case "keeper-health":
 		return runKeeperHealth(rest)
+	case "disk-autoscale":
+		return runDiskAutoscale(rest)
 	case "dead-replica-gc":
 		return runDeadReplicaGc(rest)
 	case "orphaned-gc":
@@ -138,6 +140,7 @@ Usage:
   chinit replica-sync
   chinit lease-renew
   chinit keeper-health
+  chinit disk-autoscale
   chinit dead-replica-gc
   chinit orphaned-gc
   chinit backup-daily

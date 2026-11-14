@@ -468,22 +468,77 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 // Non-Fatal BY DESIGN (the step's Criticality is BestEffort): a reader
 // booting while a peer is down must still join; the WARNING + report
 // make a degraded boot loud in the logs.
+//
+// Self-healing: a degraded verdict now triggers one schema-sync retry
+// pass with a backoff (bounded attempts) before the final report.
+// The 2026-11-14 zombie-reader: a reader scaled out during a keeper
+// restart, every peer query timed out, the boot recorded "degraded"
+// and the node served NLB reads with an EMPTY database for hours —
+// degraded is a transient condition at boot (peers restarting), not
+// a terminal one; the retry converts it back to healthy when the
+// transient clears, and the final report still tells the truth when
+// it doesn't.
 func (b *Boot) healthGate(ctx context.Context) error {
 	if b.Spec.Role == model.RoleKeeper {
 		return nil
 	}
+	report, err := b.runHealthCheck(ctx)
+	if report != nil {
+		fmt.Fprintf(os.Stderr, "cluster health verdict:\n%s\n", report.FormatHuman())
+	}
+	if err != nil && b.Spec.Role != model.RoleBackup {
+		// The replicas/tables checks failed: peers may still be coming
+		// up (a fleet roll or a keeper restart mid-boot). Re-join via
+		// the same schema-sync the hourly timer runs, then re-check.
+		for attempt := 1; attempt <= healthRetryAttempts && ctx.Err() == nil; attempt++ {
+			fmt.Fprintf(os.Stderr, "health gate degraded (attempt %d/%d): retrying schema-sync before the final verdict\n",
+				attempt, healthRetryAttempts)
+			if serr := b.gateSchemaSync(ctx); serr != nil {
+				fmt.Fprintf(os.Stderr, "WARNING: health-gate schema-sync retry failed: %v\n", serr)
+			}
+			select {
+			case <-time.After(healthRetryBackoff):
+			case <-ctx.Done():
+			}
+			report, err = b.runHealthCheck(ctx)
+			if report != nil {
+				fmt.Fprintf(os.Stderr, "cluster health verdict (retry %d):\n%s\n", attempt, report.FormatHuman())
+			}
+			if err == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("post-boot cluster health check still degraded after %d schema-sync retries (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w",
+			healthRetryAttempts, err)
+	}
+	if err != nil {
+		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w", err)
+	}
+	return nil
+}
+
+// healthRetryAttempts/backoff bound the health-gate self-healing loop:
+// enough to ride out a fleet roll or keeper restart (~4 minutes of
+// retries), short enough to never wedge an ASG boot.
+const (
+	healthRetryAttempts = 3
+	healthRetryBackoff  = 90 * time.Second
+)
+
+// runHealthCheck is the health gate's single probe pass.
+func (b *Boot) runHealthCheck(ctx context.Context) (*HealthReport, error) {
 	// The admin password file is the credentials source (the boot
 	// resolved it in retrieve_passwords); the typed request carries
 	// the value, never an argv.
 	pw, err := os.ReadFile(BootstrapDir + "/admin-password")
 	if err != nil {
-		return fmt.Errorf("read admin password file: %w", err)
+		return nil, fmt.Errorf("read admin password file: %w", err)
 	}
 	// The health check requires the inventory (the same CR-name →
 	// address map the render uses) and refuses to run without it.
 	hosts, note := b.clusterHostsWithSource()
 	if len(hosts) == 0 {
-		return fmt.Errorf("post-boot cluster health check skipped: host inventory is empty")
+		return nil, fmt.Errorf("post-boot cluster health check skipped: host inventory is empty")
 	}
 	if note != "" {
 		slog.Warn(note)
@@ -499,11 +554,11 @@ func (b *Boot) healthGate(ctx context.Context) error {
 	}
 	cr, err := b.LoadCHI(ctx)
 	if err != nil {
-		return fmt.Errorf("post-boot health check could not load the spec: %w", err)
+		return nil, fmt.Errorf("post-boot health check could not load the spec: %w", err)
 	}
 	tables := operator.ExpectedTablesFromCR(cr)
 	svc := NewHealthService(operator.NewHealthProbe(), keeper.NewProbe(), func() []domain.TableRef { return tables })
-	report, err := svc.Check(ctx, HealthRequest{
+	return svc.Check(ctx, HealthRequest{
 		ClusterName:   b.Spec.ClusterName,
 		Hosts:         hosts,
 		Credentials:   domain.Credentials{Username: "admin", Password: strings.TrimSpace(string(pw))},
@@ -512,13 +567,39 @@ func (b *Boot) healthGate(ctx context.Context) error {
 		CheckTables:   true,
 		SelfName:      b.Identity.Hostname,
 	})
-	if report != nil {
-		fmt.Fprintf(os.Stderr, "cluster health verdict:\n%s\n", report.FormatHuman())
+}
+
+// gateSchemaSync re-runs the schema propagation in-process (the same
+// service the schema-sync unit/timer drives — never a shell-out, so
+// the gate's retry inherits the library's own retry semantics).
+func (b *Boot) gateSchemaSync(ctx context.Context) error {
+	if b.Spec.Role == model.RoleKeeper || b.Spec.Role == model.RoleBackup {
+		return nil
 	}
+	pw, err := os.ReadFile(BootstrapDir + "/admin-password")
 	if err != nil {
-		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w", err)
+		return fmt.Errorf("read admin password file: %w", err)
 	}
-	return nil
+	hosts, _ := b.clusterHostsWithSource()
+	cr, err := b.LoadCHI(ctx)
+	if err != nil {
+		return fmt.Errorf("schema-sync retry could not load the spec: %w", err)
+	}
+	svc := NewSchemaService(operator.NewSchemaClientFactory())
+	// The retry is the boot's own heal: a reader that booted mid-churn
+	// holds no replica registrations worth pruning, but a REPLACEMENT
+	// must drop its predecessor's stale row before the create or the
+	// sync re-attaches the dead registration (Code 253).
+	return svc.SyncSchema(ctx, SchemaRequest{
+		ClusterName:  b.Spec.ClusterName,
+		Credentials:  domain.Credentials{Username: "admin", Password: strings.TrimSpace(string(pw))},
+		NormalizedCR: cr,
+		Hosts:        hosts,
+	}, domain.SchemaSyncRequest{
+		HostName:       b.Identity.Hostname,
+		Retries:        DefaultSchemaSyncRetries,
+		PruneStaleSelf: true,
+	})
 }
 
 // prometheusReload reloads the config so the metrics endpoint comes up

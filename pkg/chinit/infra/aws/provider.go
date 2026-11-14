@@ -35,7 +35,8 @@ import (
 
 // Provider is the AWS entry in chinit's provider registry. It composes
 // the mandatory capabilities and implements the optional ones (ordinal
-// claims, DNS, spot) — the registry constructor wires the real clients.
+// claims, DNS, spot, metrics) — the registry constructor wires the real
+// clients.
 type Provider struct {
 	region string
 	spec   *model.BootSpec
@@ -49,6 +50,8 @@ type Provider struct {
 	lister          *DynamoDBClaimLister
 	dns             *Route53Registrar
 	spot            *SpotWatcher
+	metrics         *CloudWatchPusher
+	volumes         *VolumeGrower
 }
 
 // Compile-time capability checks: the factory relies on these.
@@ -58,6 +61,8 @@ var (
 	_ port.LeaseLister    = (*Provider)(nil)
 	_ port.DNSRegistrar   = (*Provider)(nil)
 	_ port.SpotSignals    = (*Provider)(nil)
+	_ port.MetricPusher   = (*Provider)(nil)
+	_ port.VolumeGrower   = (*Provider)(nil)
 )
 
 // New builds the AWS provider with real SDK clients. The metadata
@@ -78,6 +83,8 @@ func New(cfg port.Config) port.Provider {
 	p.lister = NewDynamoDBClaimLister(region)
 	p.dns = NewRoute53Registrar(region)
 	p.spot = NewSpotWatcher()
+	p.metrics = NewCloudWatchPusher(region)
+	p.volumes = NewVolumeGrower(region)
 	return p
 }
 
@@ -172,6 +179,28 @@ func (p *Provider) DeleteARecord(ctx context.Context, req port.ARecordRequest) e
 // arrives, then delivers it once.
 func (p *Provider) Watch(ctx context.Context) <-chan port.InterruptionNotice {
 	return p.spot.Watch(ctx)
+}
+
+// PutMetric publishes one self-healing datapoint (keeper_up, resize
+// outcomes) — the MetricPusher capability the recurring jobs probe
+// for before degrading to log-only.
+func (p *Provider) PutMetric(ctx context.Context, req port.MetricPushRequest) error {
+	return p.metrics.PutMetric(ctx, req)
+}
+
+// DescribeOwnVolume returns the data volume attached to this instance.
+func (p *Provider) DescribeOwnVolume(ctx context.Context, req port.VolumeGrowRequest) (*port.VolumeInfo, error) {
+	return p.volumes.DescribeOwnVolume(ctx, req)
+}
+
+// GrowVolume extends this instance's volume online (no-op at target).
+func (p *Provider) GrowVolume(ctx context.Context, volumeID string, targetSizeGB int32) (bool, error) {
+	return p.volumes.GrowVolume(ctx, volumeID, targetSizeGB)
+}
+
+// WaitForModification blocks until the volume modification completes.
+func (p *Provider) WaitForModification(ctx context.Context, volumeID string) error {
+	return p.volumes.WaitForModification(ctx, volumeID)
 }
 
 // awsConfig loads the SDK config with the provider's region pin. Every

@@ -110,7 +110,7 @@ var _ = Describe("chinitUnits", func() {
 	})
 
 	Context("reader, lease identity", func() {
-		It("installs lease-renew but never the maintenance units", func() {
+		It("installs lease-renew and disk-autoscale but never the maintenance units", func() {
 			spec := baseSpec()
 			spec.Role = model.RoleReader
 			spec.WriterMax = 0
@@ -120,8 +120,25 @@ var _ = Describe("chinitUnits", func() {
 
 			names := unitNames(b.chinitUnits())
 			Expect(names).To(ContainElements("lease-renew.service", "lease-renew.timer"))
+			// Self-healing contract: every server node with a data
+			// disk keeps its own headroom (the 2026-11-14 merge stall
+			// was a READER's disk).
+			Expect(names).To(ContainElements("disk-autoscale.service", "disk-autoscale.timer"))
 			Expect(names).NotTo(ContainElement("dead-replica-gc.service"))
 			Expect(names).NotTo(ContainElement("orphaned-data-gc.service"))
+		})
+
+		It("runs disk-autoscale every five minutes", func() {
+			spec := baseSpec()
+			spec.Role = model.RoleReader
+			spec.WriterMax = 0
+			spec.ReaderMax = 10
+			b := &Boot{Spec: &spec}
+			for _, u := range b.chinitUnits() {
+				if u.Name == "disk-autoscale.timer" {
+					Expect(u.Content).To(ContainSubstring("OnCalendar=*-*-* *:00/5:00"))
+				}
+			}
 		})
 
 		It("describes lease-renew as node-scoped, not reader-scoped", func() {
@@ -147,14 +164,24 @@ var _ = Describe("chinitUnits", func() {
 	})
 
 	Context("keeper", func() {
-		It("installs only the keeper-health probe", func() {
+		It("installs the keeper-health probe AND its every-minute timer", func() {
 			spec := baseSpec()
 			spec.Role = model.RoleKeeper
 			spec.IdentityMode = model.IdentityStatic
 			b := &Boot{Spec: &spec}
 
+			// Self-healing contract (the 2026-11-13 blind window): the
+			// probe without a timer never ran again after boot, and
+			// keeper_down sat INSUFFICIENT_DATA. The timer is the fix.
 			names := unitNames(b.chinitUnits())
-			Expect(names).To(Equal([]string{"keeper-health.service"}))
+			Expect(names).To(Equal([]string{"keeper-health.service", "keeper-health.timer"}))
+
+			for _, u := range b.chinitUnits() {
+				if u.Name == "keeper-health.timer" {
+					Expect(u.Content).To(ContainSubstring("OnCalendar=*-*-* *:*:00"))
+					Expect(u.Content).To(ContainSubstring("keeper_up"))
+				}
+			}
 		})
 	})
 
