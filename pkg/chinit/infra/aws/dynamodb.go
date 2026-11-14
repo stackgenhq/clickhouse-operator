@@ -80,8 +80,10 @@ func (c *DynamoDBClaimer) clientOrInit(ctx context.Context) (DynamoDBAPI, error)
 // lease and its renewal cron keeps it alive until the instance dies).
 //
 // The conditional put (attribute_not_exists(hostname) OR lease_until <
-// now) is the atomicity primitive: two readers racing for reader-0
-// cannot both win, and an expired lease is claimable by anyone.
+// now OR instance_id = :me) is the atomicity primitive: two readers
+// racing for reader-0 cannot both win, an expired lease is claimable by
+// anyone, and a node re-running its own claim (boot --refresh) re-takes
+// its own lease instead of walking to the next ordinal.
 func (c *DynamoDBClaimer) Claim(ctx context.Context, req chinitport.ClaimRequest) (int, error) {
 	// An empty table name would put every conditional item into a
 	// bogus PutItem call (the rendered-spec blind spot: the claim
@@ -109,12 +111,20 @@ func (c *DynamoDBClaimer) Claim(ctx context.Context, req chinitport.ClaimRequest
 			if err != nil {
 				return -1, fmt.Errorf("marshal claim item: %w", err)
 			}
+			// The instance_id disjunct lets a node RE-CLAIM the lease it
+			// already holds: without it a re-run raced its own live lease
+			// and walked to the NEXT free ordinal (the 2026-11 live
+			// finding: a refresh re-claim renumbered the reader from
+			// reader-0 to reader-1). Re-claiming your own lease is a
+			// no-op that only refreshes the TTL — exactly what a refresh
+			// wants. Leases held by OTHER instances are untouched.
 			_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 				TableName:           awsString(req.Table),
 				Item:                item,
-				ConditionExpression: awsString("attribute_not_exists(hostname) OR lease_until < :now"),
+				ConditionExpression: awsString("attribute_not_exists(hostname) OR lease_until < :now OR instance_id = :me"),
 				ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 					":now": &dynamodbtypes.AttributeValueMemberN{Value: strconv.FormatInt(now, 10)},
+					":me":  &dynamodbtypes.AttributeValueMemberS{Value: req.InstanceID},
 				},
 			})
 			if err == nil {

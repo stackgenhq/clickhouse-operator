@@ -103,10 +103,12 @@ func runBoot(args []string) error {
 		return fail.Fatal(err)
 	}
 	boot := &service.Boot{
-		Spec:     spec,
-		Provider: provider,
-		Meta:     meta,
-		SpecHash: specHash,
+		Spec:      spec,
+		Provider:  provider,
+		Meta:      meta,
+		SpecHash:  specHash,
+		Refresh:   flags.refresh,
+		StatePath: flags.statePath,
 	}
 	steps, err := boot.Steps(ctx)
 	if err != nil {
@@ -128,7 +130,9 @@ func runBoot(args []string) error {
 	engine := service.NewEngine(nil, store)
 	// The spec hash keys resume; the identity persister writes the
 	// settled identity the moment the claim/derivation finishes.
-	engine = engine.WithIdentity(nil, detected.Provider, specHash)
+	// Refresh mode: every step re-executes; the identity comes from
+	// the state file (never re-claimed) — see Boot.Refresh.
+	engine = engine.WithIdentity(nil, detected.Provider, specHash).WithRefresh(flags.refresh)
 	boot.PersistIdentity = engine.IdentityPersister(detected.Provider)
 	res := engine.Run(ctx, steps)
 

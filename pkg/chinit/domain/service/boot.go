@@ -16,6 +16,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,6 +64,15 @@ type Boot struct {
 	// Identity is filled by the identity step; later steps and the
 	// node-env writer read it.
 	Identity model.NodeIdentity
+
+	// Refresh marks the run as an in-place refresh of a converged node
+	// (vs. a first boot): every step re-executes, the identity is taken
+	// from the state file when present (a refresh must NEVER re-claim an
+	// ordinal lease — the node is a live cluster member), and the
+	// keeper-ensemble wipe is skipped (raft state is live, not residue).
+	Refresh bool
+	// StatePath overrides ChinitStatePath (tests); empty means default.
+	StatePath string
 
 	// SpecHash gates resume: a new bundle hash invalidates prior step
 	// results so the pipeline re-renders.
@@ -186,6 +196,28 @@ func (b *Boot) WriteNodeEnv(path string) error {
 		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 	}
 	return os.WriteFile(path, []byte(sb.String()), 0600)
+}
+
+// loadBootIdentity reads the persisted identity snapshot from the state
+// file. Used by the refresh path; distinct from the subcommands' nodeState
+// because the service package owns the state schema. Fails closed: an
+// unreadable or empty state means we know NOTHING about who this node is,
+// and refreshing under a guessed identity would re-key the cluster.
+func loadBootIdentity(path string) (bootIdentity, error) {
+	var st struct {
+		Identity bootIdentity `json:"identity"`
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return bootIdentity{}, fmt.Errorf("read %s: %w (was `chinit boot` ever run on this node?)", path, err)
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		return bootIdentity{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if st.Identity.Hostname == "" {
+		return bootIdentity{}, fmt.Errorf("%s carries no settled identity — run the boot path first", path)
+	}
+	return st.Identity, nil
 }
 
 // LoadCHI loads the CHI spec the bundle delivered (the chctl library

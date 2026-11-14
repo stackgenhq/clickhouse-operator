@@ -106,6 +106,27 @@ var _ = Describe("Engine identity persistence", func() {
 			"identity clobbered by step records: %+v", st.Identity)
 	})
 
+	It("refresh mode re-executes every step even when the state file says done", func() {
+		store, err := NewFileStateStore(GinkgoT().TempDir() + "/state.json")
+		Expect(err).NotTo(HaveOccurred())
+
+		ran := 0
+		step := func() Step {
+			return StepFunc("install_static_configs", Critical, onceFatal, func(context.Context) error {
+				ran++
+				return nil
+			})
+		}
+		// Two boots under the same hash: the second would normally resume-skip.
+		Expect(NewEngine(nil, store).WithIdentity(nil, "aws", "hash-1").Run(context.Background(), []Step{step()}).Fatality).NotTo(HaveOccurred())
+		Expect(NewEngine(nil, store).WithIdentity(nil, "aws", "hash-1").Run(context.Background(), []Step{step()}).Fatality).NotTo(HaveOccurred())
+		Expect(ran).To(Equal(1), "control: the second run resumes (no re-execution)")
+		// The refresh path re-executes regardless.
+		Expect(NewEngine(nil, store).WithIdentity(nil, "aws", "hash-1").WithRefresh(true).
+			Run(context.Background(), []Step{step()}).Fatality).NotTo(HaveOccurred())
+		Expect(ran).To(Equal(2), "refresh mode re-runs the done step")
+	})
+
 	It("invalidates done-step records when the bundle hash changes; the same hash resumes", func() {
 		store, err := NewFileStateStore(GinkgoT().TempDir() + "/state.json")
 		Expect(err).NotTo(HaveOccurred())

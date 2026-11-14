@@ -251,6 +251,12 @@ type Engine struct {
 	// bundle hash re-runs every step (re-render), a re-run against the
 	// SAME hash resumes (skips done steps).
 	specHash string
+	// refresh is set by the refresh path: identity is restored from the
+	// state file instead of re-derived (a re-claimed identity would
+	// renumber the node mid-flight — but note the engine itself does not
+	// act on this flag; the Boot pipeline branches on Boot.Refresh), and
+	// every step re-executes instead of resuming past done steps.
+	refresh bool
 	// shared is the ONE in-memory state object the run and the
 	// identity persister both mutate. Without it the persister's
 	// Load+Save races the run's Load-at-start+Save-per-step: the
@@ -274,6 +280,17 @@ func NewEngine(clock Clock, store StateStore) *Engine {
 		clock = NewWallClock()
 	}
 	return &Engine{clock: clock, stateStore: store}
+}
+
+// WithRefresh switches the run to refresh semantics: every step re-executes
+// (no resume-skip), the settle_identity step re-uses the persisted identity
+// instead of re-claiming leases, and keeper raft state is preserved. The
+// engine still records results (refresh outcomes are observable in the state
+// file and [TIMING] output, and a fatal refresh failure leaves the node loud
+// rather than silently half-applied).
+func (e *Engine) WithRefresh(refresh bool) *Engine {
+	e.refresh = refresh
+	return e
 }
 
 // WithIdentity pins the settled-identity snapshot and the spec hash the
@@ -382,6 +399,9 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 	if e.specHash != "" && state.SpecHash != "" && state.SpecHash != e.specHash {
 		state.Steps = nil
 	}
+	if e.refresh {
+		state.Steps = nil
+	}
 	if e.snapshot != nil {
 		state.Identity = e.snapshot
 	}
@@ -394,11 +414,16 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 
 		// Resume: a step recorded done (and not superseded by a newer
 		// spec hash — the caller re-runs deliberately when it wants
-		// re-execution, e.g. a new bundle hash) is skipped.
-		if prior := state.findStep(st.Name()); prior != nil && prior.Status == "done" {
-			outcome.Skipped = true
-			res.Steps = append(res.Steps, outcome)
-			continue
+		// re-execution, e.g. a new bundle hash) is skipped. Refresh mode
+		// always re-executes: the point of a refresh is to converge the
+		// node onto the CURRENT spec/bundle even when nothing else
+		// changed since the last boot.
+		if !e.refresh {
+			if prior := state.findStep(st.Name()); prior != nil && prior.Status == "done" {
+				outcome.Skipped = true
+				res.Steps = append(res.Steps, outcome)
+				continue
+			}
 		}
 
 		start := e.clock.Now()

@@ -135,7 +135,7 @@ the BootSpec (chinit.yaml) and installs its own recurring jobs as
 subcommands.
 
 Usage:
-  chinit boot [-spec chinit.yaml] [-cloud aws|azure] [-dry-run]
+  chinit boot [-spec chinit.yaml] [-cloud aws|azure] [-dry-run] [-refresh]
   chinit schema-sync [-retries N] [-prune-stale-self]
   chinit replica-sync
   chinit lease-renew
@@ -159,6 +159,7 @@ type bootFlags struct {
 	specPath  string
 	cloud     string
 	dryRun    bool
+	refresh   bool
 	statePath string
 }
 
@@ -168,6 +169,7 @@ func parseBootFlags(args []string) (*bootFlags, error) {
 	fs.StringVar(&f.specPath, "spec", "/var/lib/clickhouse-bootstrap/chinit.yaml", "path to chinit.yaml")
 	fs.StringVar(&f.cloud, "cloud", "", "cloud provider override (aws|azure); empty = detect")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "validate the spec and print the plan without acting")
+	fs.BoolVar(&f.refresh, "refresh", false, "in-place refresh of a converged node: re-execute every step against the live node (never re-claims identity, never wipes keeper raft state)")
 	fs.StringVar(&f.statePath, "state", "/var/lib/chinit/state.json", "state file path")
 	if err := fs.Parse(args); err != nil {
 		return nil, err

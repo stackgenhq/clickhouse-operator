@@ -26,9 +26,9 @@ import (
 	"strings"
 	"time"
 
+	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
-	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 )
 
 // bundleFiles mirrors the AWS provider's closed bundle member list (the
@@ -91,6 +91,16 @@ func (c *TableClaimer) Claim(ctx context.Context, req chinitport.ClaimRequest) (
 	for time.Now().Before(deadline) {
 		for ordinal := 0; ordinal < req.Count; ordinal++ {
 			hostname := req.Prefix + strconv.Itoa(ordinal)
+			// Self-refresh FIRST: if this instance already holds the
+			// row, extend it in place instead of treating our own
+			// lease as someone else's blocker (mirrors the AWS
+			// instance_id disjunct).
+			if lease, ok := c.readLease(ctx, req.Table, hostname); ok && lease.InstanceID == req.InstanceID {
+				if c.refreshOwnLease(ctx, req, lease) {
+					return ordinal, nil
+				}
+				continue
+			}
 			// Existing expired lease → DELETE then insert (Azure has no
 			// conditional expression on properties; the takeover is a
 			// two-step: read, check expiry, delete, insert).
@@ -129,6 +139,48 @@ func (c *TableClaimer) insertIfAbsent(ctx context.Context, req chinitport.ClaimR
 		IP:           req.PrivateIP,
 		LeaseUntil:   time.Now().Unix() + int64(req.LeaseSeconds),
 	})
+}
+
+// readLease fetches the current lease row for hostname. Returns
+// (entity, true) when the row exists and parses; (_, false) otherwise.
+func (c *TableClaimer) readLease(ctx context.Context, table, hostname string) (leaseEntity, bool) {
+	var zero leaseEntity
+	url := c.entityURL(table, "readers", hostname)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return zero, false
+	}
+	token, err := c.TokenSource(ctx, "https://storage.azure.com/")
+	if err != nil {
+		return zero, false
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json;odata=nometadata")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return zero, false
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return zero, false
+	}
+	var entity leaseEntity
+	if err := jsonUnmarshal(body, &entity); err != nil {
+		return zero, false
+	}
+	return entity, true
+}
+
+// refreshOwnLease re-takes a lease row this instance already holds:
+// unconditional MERGE of an in-place TTL bump. Mirrors the AWS path's
+// self re-claim — a node re-running boot --refresh extends its own
+// lease instead of treating it as someone else's blocker. Callers must
+// have verified entity.InstanceID == req.InstanceID first.
+func (c *TableClaimer) refreshOwnLease(ctx context.Context, req chinitport.ClaimRequest, lease leaseEntity) bool {
+	lease.LeaseUntil = time.Now().Unix() + int64(req.LeaseSeconds)
+	lease.IP = req.PrivateIP
+	return c.putEntity(ctx, req.Table, lease.RowKey, false, lease)
 }
 
 // insert writes without the absence condition (takeover after delete).
@@ -194,7 +246,7 @@ func (c *TableClaimer) takeExpired(ctx context.Context, table, hostname string) 
 		return false
 	}
 	body, _ := io.ReadAll(resp.Body)
-	etag := strings.Trim(resp.Header.Get("ETag"), `"` )
+	etag := strings.Trim(resp.Header.Get("ETag"), `"`)
 	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return false // absent: insertIfAbsent handles it

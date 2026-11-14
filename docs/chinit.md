@@ -69,6 +69,34 @@ The settled identity (hostname, CR name, lease, DNS zone) is persisted to
 `/var/lib/chinit/state.json` at claim time — the job subcommands reload
 it, never re-derive (the typed version of the bash node-env contract).
 
+### `chinit boot --refresh`
+
+Re-applies the CURRENT spec/bundle to a **live** node without re-imaging:
+
+```
+chinit boot --refresh          # same pipeline, no resume-skip, idempotent
+```
+
+What it does differently from a plain boot:
+
+- **Resume is disabled** — every step re-executes (the point is to
+  converge the node onto the current bundle even when nothing looks
+  different).
+- **Identity is restored, never re-claimed.** The persisted identity is
+  re-validated (lease holder must still be this instance for lease-mode
+  nodes; static mode re-derives from the IP and compares) and re-renewed,
+  but never re-claimed from the table — a re-claim could renumber a live
+  member of the cluster.
+- **Keeper raft state is never wiped** — the `coordination/` wipe that a
+  first boot needs is skipped.
+- **First-boot-only side effects are skipped** (e.g. the metadata-disk
+  wipe) and the service is **restarted** (not `enable --now`) so the
+  re-rendered config actually takes effect.
+
+The refresh is what the stack's config refresher invokes over SSM when a
+node's `chinit-<role>.yaml` (or the bundle it pins) changes — the
+spec-only edit path that previously required a re-image.
+
 ## The spec
 
 `chinit.yaml` (rendered by Terraform per role, uploaded to the bundle

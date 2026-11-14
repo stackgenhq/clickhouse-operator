@@ -382,12 +382,19 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 	// coordination dir is exit code 76 CANNOT_OPEN_FILE Permission
 	// denied (the live chinit-cutover finding: the dir was created
 	// AFTER the mount step's chown ran, as root, and never re-owned).
-	for _, base := range []string{
-		"/var/lib/clickhouse/coordination",
-		"/var/lib/clickhouse-keeper",
-	} {
-		if err := os.RemoveAll(filepath.Join(base, "coordination")); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("clear keeper coordination state: %w", err)
+	//
+	// Refresh mode MUST NOT wipe: the node is a LIVE ensemble member and
+	// the raft log/snapshots are its vote. Wiping on a refresh would
+	// amputate the member from quorum. (First boot on a fresh disk has
+	// nothing to wipe anyway.)
+	if !b.Refresh {
+		for _, base := range []string{
+			"/var/lib/clickhouse/coordination",
+			"/var/lib/clickhouse-keeper",
+		} {
+			if err := os.RemoveAll(filepath.Join(base, "coordination")); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("clear keeper coordination state: %w", err)
+			}
 		}
 	}
 	for _, dir := range []string{
@@ -404,6 +411,15 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 		"/var/lib/clickhouse/coordination", "/var/lib/clickhouse-keeper")
 	if err != nil {
 		return fmt.Errorf("chown keeper state dirs: %w: %s", err, out)
+	}
+	if b.Refresh {
+		// A refresh must make the (possibly re-rendered) config take effect;
+		// enable --now would leave the running keeper on the old config.
+		// Raft state is on disk — a restart rejoins the ensemble.
+		if out, rerr := runCommand(ctx, "systemctl", "restart", "clickhouse-keeper"); rerr != nil {
+			return fmt.Errorf("restart clickhouse-keeper after config refresh: %w: %s", rerr, out)
+		}
+		return nil
 	}
 	out, err = runCommand(ctx, "systemctl", "enable", "--now", "clickhouse-keeper")
 	if err != nil {
@@ -423,9 +439,12 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 
 	// First-boot metadata cleanup (UNKNOWN_DISK avoidance): a blank
 	// metadata disk with stale system tables from image-baking wedges
-	// the first start.
+	// the first start. Skipped on refresh — wiping /var/lib/clickhouse
+	// on a live node would delete the very data the node serves.
 	marker := "/var/lib/clickhouse/first_boot_done"
-	if _, err := os.Stat(marker); os.IsNotExist(err) {
+	if b.Refresh {
+		// fall through to the restart below
+	} else if _, err := os.Stat(marker); os.IsNotExist(err) {
 		_, _ = runCommand(ctx, "systemctl", "stop", "clickhouse-server")
 		_ = os.RemoveAll("/var/lib/clickhouse/store")
 		_ = os.RemoveAll("/var/lib/clickhouse/data/system")
@@ -441,7 +460,13 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 	if out, err := runCommand(ctx, "systemctl", "enable", "clickhouse-server"); err != nil {
 		return Fatal(fmt.Errorf("enable clickhouse-server: %w: %s", err, out))
 	}
-	if out, err := runCommand(ctx, "systemctl", "start", "clickhouse-server"); err != nil {
+	if b.Refresh {
+		// Refresh: make the re-rendered config take effect. restart
+		// (not start) so a running server re-reads users.d/config.d.
+		if out, err := runCommand(ctx, "systemctl", "restart", "clickhouse-server"); err != nil {
+			return Fatal(fmt.Errorf("restart clickhouse-server: %w: %s", err, out))
+		}
+	} else if out, err := runCommand(ctx, "systemctl", "start", "clickhouse-server"); err != nil {
 		return Fatal(fmt.Errorf("start clickhouse-server: %w: %s", err, out))
 	}
 
@@ -485,6 +510,18 @@ func (b *Boot) healthGate(ctx context.Context) error {
 	report, err := b.runHealthCheck(ctx)
 	if report != nil {
 		fmt.Fprintf(os.Stderr, "cluster health verdict:\n%s\n", report.FormatHuman())
+	}
+	// Refresh restarts the server under a live cluster: a transient
+	// degradation is EXPECTED while the node rejoins, and the boot-path
+	// retry loop costs up to ~5 minutes of wall clock inside a 300s SSM
+	// command. One probe, one report, no gate — the hourly schema-sync
+	// and the node's own replication are the recovery path, and the
+	// refresher's roll ordering already paces the fleet.
+	if b.Refresh {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: post-refresh cluster health check degraded (node still serves; investigate via RUNBOOK_CLUSTER_HEALTH.md): %v\n", err)
+		}
+		return nil
 	}
 	if err != nil && b.Spec.Role != model.RoleBackup {
 		// The replicas/tables checks failed: peers may still be coming

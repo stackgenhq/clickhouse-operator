@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -171,6 +172,173 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 	return steps, nil
 }
 
+// crNameFromHostname derives the CR slot ("01-<n>") from a settled hostname:
+// writers occupy slots 0..WriterMax-1, readers occupy WriterMax..WriterMax+ReaderMax-1.
+// Returns ok=false for hostnames that carry no CR slot (keepers, backup).
+func crNameFromHostname(spec *model.BootSpec, hostname string) (string, int, bool) {
+	writerPrefix := spec.WriterHostPrefix
+	if writerPrefix == "" {
+		writerPrefix = "writer-"
+	}
+	readerPrefix := spec.ReaderHostPrefix
+	if readerPrefix == "" {
+		readerPrefix = "reader-"
+	}
+	switch {
+	case strings.HasPrefix(hostname, writerPrefix):
+		if n, err := strconv.Atoi(strings.TrimPrefix(hostname, writerPrefix)); err == nil && n >= 0 {
+			return fmt.Sprintf("01-%d", n), n, true
+		}
+	case strings.HasPrefix(hostname, readerPrefix):
+		offset := spec.WriterMax
+		if offset == 0 {
+			offset = spec.WriterCount
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(hostname, readerPrefix)); err == nil && n >= 0 {
+			return fmt.Sprintf("01-%d", offset+n), offset + n, true
+		}
+	}
+	return "", 0, false
+}
+
+// restoreIdentity is the refresh path's identity settle: take the identity
+// the boot persisted in the state file and reuse it. The identity is the
+// cluster's name for this node — CR slot in remote_servers/macros, the DNS
+// A record, the ReplicatedMergeTree replica path — so a refresh must
+// reproduce it exactly or fail loudly. Re-claiming is NOT an option (the
+// old flow silently renumbered the live reader from reader-0/01-2 to
+// reader-1/01-3; the CR slot, DNS and replicated metadata disagree on who
+// the node is).
+//
+// Validation by identity mode:
+//   - lease: the lease row for the persisted hostname must still be held
+//     by THIS instance (renew proves it without moving the ordinal). If it
+//     lapsed and a different instance took it, this node has lost its
+//     claim to the identity and must not serve under it — Fatal (the ASG
+//     replaces the node).
+//   - static: re-derive from the private IP exactly as a first boot would
+//     and compare; a mismatch means the machine was re-provisioned with a
+//     different offset and must not keep serving the persisted name.
+//
+// On success the lease is renewed (best-effort TTL top-up), the hostname is
+// re-asserted, and the state file identity is refreshed in place (the DNS
+// zone id may have been learned since the last settle).
+func (b *Boot) restoreIdentity(ctx context.Context) error {
+	statePath := ChinitStatePath
+	if b.StatePath != "" {
+		statePath = b.StatePath
+	}
+	stored, err := loadBootIdentity(statePath)
+	if err != nil {
+		return Fatal(err)
+	}
+	if model.Role(stored.Role) != b.Spec.Role {
+		return Fatal(fmt.Errorf("state role %q != spec role %q — refusing to refresh a node whose role changed; re-image instead", stored.Role, b.Spec.Role))
+	}
+	if stored.InstanceID != b.Meta.InstanceID {
+		return Fatal(fmt.Errorf("state instance %s != this instance %s — refusing to refresh under a foreign identity (re-image the node instead)", stored.InstanceID, b.Meta.InstanceID))
+	}
+
+	id := model.NodeIdentity{
+		Role:        model.Role(stored.Role),
+		Hostname:    stored.Hostname,
+		InstanceID:  stored.InstanceID,
+		PrivateIP:   b.Meta.PrivateIP, // authoritative from metadata, not the (possibly stale) snapshot
+		Region:      b.Meta.Region,
+		ClusterName: b.Spec.ClusterName,
+		DNSZone:     b.Spec.DNSZoneName,
+		CRName:      stored.CRName,
+		CROrdinal:   stored.CROrdinal,
+		ZoneID:      stored.ZoneID,
+		LeaseTable:  stored.LeaseTable,
+	}
+
+	switch b.Spec.IdentityMode {
+	case model.IdentityStatic:
+		hostname, ordinal := StaticHostname(b.Meta.PrivateIP)
+		if hostname == "" {
+			return Fatal(fmt.Errorf("private IP %s does not map to a static role offset (writers +10..19, keepers +20..29, backup +30)", b.Meta.PrivateIP))
+		}
+		if hostname != stored.Hostname {
+			return Fatal(fmt.Errorf("state hostname %q != static derivation %q from IP %s — the node's placement changed; re-image instead of refreshing", stored.Hostname, hostname, b.Meta.PrivateIP))
+		}
+		id.CROrdinal = ordinal
+	case model.IdentityLease:
+		if id.LeaseTable == "" {
+			return Fatal(fmt.Errorf("state carries no lease table for lease-mode node — refusing to guess; re-image instead"))
+		}
+		claimer := port.AsOrdinalClaimer(b.Provider)
+		if claimer == nil {
+			return Fatal(fmt.Errorf("cloud %s has no ordinal-lease capability but spec demands identity_mode: lease", b.Provider.Name()))
+		}
+		// Renew proves ownership without moving the ordinal: the renew
+		// condition pins instance_id, so a renewal succeeds iff WE hold the
+		// lease. A lost lease (expired and re-taken) fails loudly here
+		// instead of silently serving under a recycled name.
+		if err := claimer.RenewLease(ctx, port.RenewRequest{
+			Table:        id.LeaseTable,
+			Hostname:     id.Hostname,
+			InstanceID:   b.Meta.InstanceID,
+			LeaseSeconds: 900,
+		}); err != nil {
+			return Fatal(fmt.Errorf("lease renew for %s failed (%v) — another instance may hold it now; do NOT keep serving under this name; re-image the node", id.Hostname, err))
+		}
+		slog.Info("identity: persisted lease renewed", "hostname", id.Hostname, "lease_table", id.LeaseTable)
+	default:
+		return Fatal(fmt.Errorf("unknown identity_mode %q in spec", b.Spec.IdentityMode))
+	}
+
+	// CR name: derive it from the HOSTNAME's ordinal rather than from the
+	// persisted CROrdinal, whose meaning differs by role (writers store
+	// the bare ordinal; readers store the writer-offset slot — Boot.CRName
+	// expects the bare ordinal in Identity.CROrdinal). The hostname is the
+	// canonical claim; everything else derives from it.
+	if crName, ord, ok := crNameFromHostname(b.Spec, id.Hostname); ok {
+		if stored.CRName != "" && crName != stored.CRName {
+			return Fatal(fmt.Errorf("CR name derived from hostname %q is %q but state says %q — spec topology changed under this node; re-image instead of refreshing", id.Hostname, crName, stored.CRName))
+		}
+		id.CRName = crName
+		id.CROrdinal = ord
+	} else if stored.CRName != "" {
+		// Keepers/backup: no CR slot; carry the persisted values through.
+		id.CRName = stored.CRName
+		id.CROrdinal = stored.CROrdinal
+	}
+
+	b.Identity = id
+	if b.PersistIdentity != nil {
+		b.PersistIdentity(id)
+	}
+	if err := b.setHostname(ctx, id.Hostname); err != nil {
+		slog.Warn("WARNING: could not set system hostname", "hostname", id.Hostname, "err", err)
+	}
+
+	// Re-assert DNS (same record the first boot wrote): best-effort, same
+	// contract as the boot path.
+	if dns := port.AsDNSRegistrar(b.Provider); dns != nil {
+		zoneID := id.ZoneID
+		if zoneID == "" {
+			zoneID, _ = dns.ResolveZoneID(ctx, b.Spec.DNSZoneName)
+		}
+		if zoneID != "" {
+			id.ZoneID = zoneID
+			b.Identity = id
+			if err := dns.UpsertARecord(ctx, port.ARecordRequest{
+				ZoneID:     zoneID,
+				ZoneName:   b.Spec.DNSZoneName,
+				RecordName: id.Hostname,
+				IP:         id.PrivateIP,
+				TTL:        60,
+			}); err != nil {
+				slog.Warn("WARNING: DNS re-registration failed; boot continues", "hostname", id.Hostname, "err", err)
+			} else if b.PersistIdentity != nil {
+				b.PersistIdentity(id)
+			}
+		}
+	}
+	return nil
+}
+
 // settleIdentity derives or claims the node identity and registers DNS.
 // Static nodes (keepers/backup — and writers while the static path still
 // exists) map the IP octet; lease nodes (BOTH ASG roles — readers and,
@@ -186,6 +354,17 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 // scaled-out node claims the first free slot in [0, max) and never
 // exceeds the CR slot ceiling the CHI spec reserved.
 func (b *Boot) settleIdentity(ctx context.Context) error {
+	// Refresh mode: an in-place refresh of a converged node must keep the
+	// identity the cluster already knows — re-claiming here would renumber
+	// the node out from under ReplicatedMergeTree's replica paths and the
+	// DNS A records. The persisted identity is re-validated against the
+	// lease table when there is one (a lease that lapsed AND was taken by
+	// another instance means we must NOT keep serving under the old name —
+	// fail loudly; the ASG replaces this node), then reused verbatim.
+	if b.Refresh {
+		return b.restoreIdentity(ctx)
+	}
+
 	id := model.NodeIdentity{
 		Role:        b.Spec.Role,
 		InstanceID:  b.Meta.InstanceID,
