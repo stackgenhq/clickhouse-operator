@@ -16,6 +16,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -91,12 +93,20 @@ func runBoot(args []string) error {
 		spec.Region = meta.Region
 	}
 
-	// The boot pipeline.
+	// The boot pipeline. The resume key covers BOTH the bundle hash
+	// (what the nodes converge to) and a digest of the spec file itself
+	// (how they converge): a spec-only change — users.d networks, tag set,
+	// listener addresses — used to leave the node un-converged because
+	// the bundle hash never changed.
+	specHash, err := specFingerprint(flags.specPath, spec.ConfigBundle.SHA256)
+	if err != nil {
+		return fail.Fatal(err)
+	}
 	boot := &service.Boot{
 		Spec:     spec,
 		Provider: provider,
 		Meta:     meta,
-		SpecHash: spec.ConfigBundle.SHA256,
+		SpecHash: specHash,
 	}
 	steps, err := boot.Steps(ctx)
 	if err != nil {
@@ -118,7 +128,7 @@ func runBoot(args []string) error {
 	engine := service.NewEngine(nil, store)
 	// The spec hash keys resume; the identity persister writes the
 	// settled identity the moment the claim/derivation finishes.
-	engine = engine.WithIdentity(nil, detected.Provider, spec.ConfigBundle.SHA256)
+	engine = engine.WithIdentity(nil, detected.Provider, specHash)
 	boot.PersistIdentity = engine.IdentityPersister(detected.Provider)
 	res := engine.Run(ctx, steps)
 
@@ -129,6 +139,24 @@ func runBoot(args []string) error {
 		return &exitCodeError{Code: exitBootFailed, Err: res.Fatality}
 	}
 	return nil
+}
+
+// specFingerprint folds the spec FILE into the resume key. The bundle
+// hash alone does not cover spec edits: the spec is read before the
+// bundle is fetched, so a spec-only change (e.g. a network CIDR in
+// users.d) left the recorded hash untouched and every boot stepped
+// over the already-"done" render steps. Hashing the raw file alongside
+// the bundle hash makes ANY spec change invalidate resume.
+func specFingerprint(specPath, bundleSHA string) (string, error) {
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		return "", fmt.Errorf("read spec for fingerprint: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	if bundleSHA == "" {
+		return "spec:" + hex.EncodeToString(sum[:]), nil
+	}
+	return bundleSHA + "+spec:" + hex.EncodeToString(sum[:]), nil
 }
 
 // loadSpec reads and validates chinit.yaml.
