@@ -449,6 +449,54 @@ func TestConfigRendererDropsVacantSlots(t *testing.T) {
 		"at least the live replica block survives the filter")
 }
 
+// TestFilterReplicaBlocksDropsEmptyShards pins the 0.2.9 crash fix:
+// the generator's all-sharded section renders ONE SHARD PER replica —
+// dropping a vacant slot's only replica must also drop the shard, or
+// ClickHouse dies at startup with std::out_of_range in
+// Cluster::addShard (the live crash-loop: "Failed with result
+// 'protocol'").
+func TestFilterReplicaBlocksDropsEmptyShards(t *testing.T) {
+	content := `<yandex>
+    <remote_servers>
+        <all-sharded>
+            <shard>
+                <replica>
+                    <host>writer-1.ch-int-dev.clickhouse.internal</host>
+                    <port>9010</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>chi-ch-int-dev-ch-int-dev-01-2</host>
+                    <port>9010</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>reader-1.ch-int-dev.clickhouse.internal</host>
+                    <port>9010</port>
+                </replica>
+            </shard>
+        </all-sharded>
+    </remote_servers>
+</yandex>`
+	out, changed, err := filterReplicaBlocks(content)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Contains(t, out, "<all-sharded>")
+	require.Contains(t, out, "<host>writer-1.ch-int-dev.clickhouse.internal</host>")
+	require.Contains(t, out, "<host>reader-1.ch-int-dev.clickhouse.internal</host>")
+	require.NotContains(t, out, "chi-ch-int-dev-ch-int-dev-01-2",
+		"the vacant slot's replica must be dropped")
+	// The surviving shards must each still hold exactly one replica:
+	// an empty <shard></shard> crashes Cluster::addShard at startup.
+	require.NotContains(t, out, "<shard>\n            </shard>",
+		"no shard may survive without replicas")
+	replicas := strings.Count(out, "<replica>")
+	shards := strings.Count(out, "<shard>")
+	require.Equal(t, replicas, shards, "every surviving shard keeps exactly one replica")
+}
+
 func TestConfigRendererRenderCHK(t *testing.T) {
 	chkSpec := []byte(`
 apiVersion: clickhouse-keeper.altinity.com/v1

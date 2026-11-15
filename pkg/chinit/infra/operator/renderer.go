@@ -1164,22 +1164,33 @@ func dropVacantReplicas(rendered []port.RenderedFile) error {
 	return nil
 }
 
-// filterReplicaBlocks strips pod-pattern <replica> blocks from one
-// remote_servers document. Line-based over the generator's fixed
-// layout: a block starts at the "<replica>" line and ends at the
-// "</replica>" line; the block's <host> line carries the address.
+// filterReplicaBlocks strips pod-pattern <replica> blocks — and any
+// <shard> block left with zero replicas — from one remote_servers
+// document. Line-based over the generator's fixed layout: a replica
+// block starts at the "<replica>" line and ends at the "</replica>"
+// line, and the block's <host> line carries the address.
+//
+// Empty shards are FATAL on the server side: ClickHouse's
+// Cluster::addShard indexes into the shard's (now empty) replica
+// vector and dies with std::out_of_range at startup (the live 0.2.9
+// finding — the all-sharded section renders ONE SHARD PER replica, so
+// dropping its only vacant replica produced <shard></shard> and the
+// server crash-looped with "Failed with result 'protocol'").
 func filterReplicaBlocks(content string) (string, bool, error) {
 	lines := strings.Split(content, "\n")
 	var kept []string
-	var block []string
-	inBlock := false
+	var replica []string
+	var shard []string
+	inReplica := false
+	inShard := false
 	changed := false
-	flush := func() {
-		if len(block) == 0 {
+
+	flushReplica := func() {
+		if len(replica) == 0 {
 			return
 		}
 		vacant := false
-		for _, l := range block {
+		for _, l := range replica {
 			t := strings.TrimSpace(l)
 			if strings.HasPrefix(t, "<host>chi-") && strings.HasSuffix(t, "</host>") {
 				vacant = true
@@ -1189,37 +1200,68 @@ func filterReplicaBlocks(content string) (string, bool, error) {
 		if vacant {
 			changed = true
 		} else {
-			kept = append(kept, block...)
+			shard = append(shard, replica...)
 		}
-		block = nil
+		replica = nil
 	}
+
+	flushShard := func() {
+		if len(shard) == 0 {
+			return
+		}
+		// A shard whose replicas were all vacant must not survive:
+		// <shard></shard> crashes Cluster::addShard at startup.
+		hasReplica := false
+		for _, l := range shard {
+			if strings.TrimSpace(l) == "<replica>" {
+				hasReplica = true
+				break
+			}
+		}
+		if !hasReplica {
+			changed = true
+		} else {
+			kept = append(kept, shard...)
+		}
+		shard = nil
+	}
+
 	for _, l := range lines {
 		t := strings.TrimSpace(l)
-		if t == "<replica>" {
-			if inBlock {
-				return "", false, fmt.Errorf("nested <replica> blocks")
+		switch {
+		case t == "<replica>" && !inReplica && inShard:
+			inReplica = true
+			replica = append(replica, l)
+		case t == "</replica>" && inReplica:
+			replica = append(replica, l)
+			inReplica = false
+			flushReplica()
+		case t == "<shard>" && !inShard:
+			if inReplica {
+				return "", false, fmt.Errorf("<shard> opened inside <replica>")
 			}
-			inBlock = true
-			block = append(block, l)
-			continue
-		}
-		if t == "</replica>" {
-			if !inBlock {
-				return "", false, fmt.Errorf("</replica> without <replica>")
+			inShard = true
+			shard = append(shard, l)
+		case t == "</shard>" && inShard:
+			if inReplica {
+				return "", false, fmt.Errorf("</shard> inside <replica>")
 			}
-			block = append(block, l)
-			inBlock = false
-			flush()
-			continue
-		}
-		if inBlock {
-			block = append(block, l)
-		} else {
+			shard = append(shard, l)
+			inShard = false
+			flushShard()
+		case inReplica:
+			replica = append(replica, l)
+		case inShard:
+			shard = append(shard, l)
+		default:
 			kept = append(kept, l)
 		}
 	}
-	if inBlock {
+	if inReplica {
 		return "", false, fmt.Errorf("unterminated <replica> block")
+	}
+	if inShard {
+		return "", false, fmt.Errorf("unterminated <shard> block")
 	}
 	return strings.Join(kept, "\n"), changed, nil
 }
