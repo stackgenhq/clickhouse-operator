@@ -1279,9 +1279,16 @@ type drainOptions struct {
 	// DeadlineSeconds bounds the whole drain (spot: the notice's
 	// reclaim window; termination hook: 240s — the hook budget).
 	DeadlineSeconds int
-	// Reason names the trigger: drainReasonSpot or
-	// drainReasonTerminationHook.
+	// Reason names the trigger: drainReasonSpot, drainReasonShutdown
+	// or drainReasonTerminationHook.
 	Reason string
+	// SkipServerShutdown leaves the local server RUNNING after the
+	// drain's replica/DNS/lease work: the shutdown-drain unit runs as
+	// ExecStop inside systemd's shutdown transaction (ordered before
+	// clickhouse-server stops), so the OS teardown owns the stop —
+	// issuing SYSTEM SHUTDOWN from inside would fight the very
+	// transaction that invoked the drain.
+	SkipServerShutdown bool
 }
 
 // runDrain is `chinit drain` (the ASG termination lifecycle hook's
@@ -1305,9 +1312,9 @@ func runDrain(args []string) error {
 		return err
 	}
 	switch *reason {
-	case drainReasonSpot, drainReasonTerminationHook:
+	case drainReasonSpot, drainReasonShutdown, drainReasonTerminationHook:
 	default:
-		return fmt.Errorf("invalid -reason %q: want %q or %q", *reason, drainReasonSpot, drainReasonTerminationHook)
+		return fmt.Errorf("invalid -reason %q: want %q, %q or %q", *reason, drainReasonSpot, drainReasonShutdown, drainReasonTerminationHook)
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("invalid -timeout %d: must be positive", *timeout)
@@ -1337,6 +1344,131 @@ func runDrain(args []string) error {
 		DeadlineSeconds: *timeout,
 		Reason:          *reason,
 	})
+}
+
+// drainReasonShutdown is the systemd-shutdown drain's reason (the
+// log context that distinguishes an OS-shutdown drain from the
+// hook's SSM invocation and the spot watcher's notice).
+const drainReasonShutdown = "shutdown"
+
+// shutdownDrainDeadlineSeconds is the shutdown drain's budget: 150s,
+// bounded well below EC2's shutdown window (default 180s for the
+// API-driven stop/scale-in path, with headroom for the OS's own
+// teardown) — the drain MUST NOT be the reason a termination times
+// out and the instance is killed mid-drain.
+const shutdownDrainDeadlineSeconds = 150
+
+// runDrainShutdown is `chinit drain-shutdown` — the in-node shutdown
+// drain the chinit-shutdown-drain.service unit's ExecStop invokes.
+//
+// Why a daemon-adjacent unit instead of (only) the ASG termination
+// hook's SSM dispatch: the OS shutdown path is the ONE signal every
+// termination mode goes through — ASG scale-in, EC2 health-check
+// replacement, spot reclaim at the deadline, operator stop. The
+// hook's SSM dispatch has a known race (SSM cannot reliably deliver
+// to a stopping instance — the agent is mid-teardown), and the
+// health-check termination NEVER fires the hook at all. Running the
+// drain from INSIDE the node at systemd stop time closes every gap
+// with no external infra: EC2 ACPI-shuts the node → systemd stops
+// units in reverse start order → this unit's ExecStop runs (ordered
+// After=clickhouse-server, so ClickHouse is still UP to serve the
+// drain's peer drop and SYSTEM STOP queries) → clickhouse-server
+// stops.
+//
+// The reboot guard: a reboot RELOADS the same node with the same
+// identity — its lease, DNS record and replica registration must all
+// survive. systemd exposes the pending shutdown target in
+// `systemctl list-jobs`; reboot.target in the job list means a
+// scheduled reboot, and the drain declines (exit 0, loud log) so the
+// node rejoins exactly as it was. poweroff.target / shutdown.target
+// / halt.target (and the ASG-driven default target on instance
+// termination) DO drain.
+func runDrainShutdown(args []string) error {
+	statePath, err := statePathFlag(args)
+	if err != nil {
+		return err
+	}
+	rebooting, err := shutdownIsReboot()
+	if err != nil {
+		// The check is best-effort BY DESIGN: a systemd IPC failure
+		// (container, missing binary) must not turn into a skipped
+		// drain on a real termination — the drain's failure modes are
+		// already all best-effort. Log loudly and proceed.
+		slog.Warn("drain-shutdown: reboot check failed; assuming termination",
+			"err", err)
+		fmt.Fprintf(os.Stderr, "WARNING: drain-shutdown: reboot check failed (%s); assuming termination\n", err)
+	} else if rebooting {
+		slog.Info("drain-shutdown: reboot detected — skipping the drain (identity survives a reboot)",
+			"hostname_path", statePath)
+		fmt.Println("drain-shutdown: reboot detected — skipping the drain (identity survives a reboot)")
+		return nil
+	}
+	st, err := loadNodeState(statePath)
+	if err != nil {
+		// Plain error (exit 1): a node that never settled identity
+		// cannot drain safely — the lease TTL (15 min) plus the
+		// weekly dead-replica GC are the safety nets, same contract
+		// as runDrain's SSM failure.
+		slog.Warn("drain-shutdown: cannot load node state; the lease TTL and the weekly dead-replica GC will clean up",
+			"state_path", statePath,
+			"err", err)
+		return fmt.Errorf("drain-shutdown: cannot load node state from %s: %s", statePath, err)
+	}
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
+	if err != nil {
+		return err
+	}
+	slog.Info("drain-shutdown: invoked",
+		"hostname", st.Identity.Hostname,
+		"budget_seconds", shutdownDrainDeadlineSeconds)
+	if err := drain(context.Background(), st, provider, drainOptions{
+		DeadlineSeconds: shutdownDrainDeadlineSeconds,
+		Reason:          drainReasonShutdown,
+		// SkipServerShutdown: systemd is already tearing the node
+		// down — the drain runs as a unit's ExecStop ordered BEFORE
+		// clickhouse-server stops. Issuing SYSTEM SHUTDOWN here (or
+		// worse, `systemctl stop clickhouse-server`) would fight the
+		// shutdown transaction that invoked us and can deadlock it
+		// (a stop job waiting on a stop job).
+		SkipServerShutdown: true,
+	}); err != nil {
+		return err
+	}
+	// The parting sweep: release every OTHER expired-slot record the
+	// dying node leaves behind — an undrained predecessor's stale
+	// record (its drain could not dispatch) would otherwise wedge
+	// peers' schema-sync/fan-outs until the next renewal tick. This
+	// node holds the provider handle and the zone already; the sweep
+	// is the cheapest point on the fleet to run it (best-effort — a
+	// failure never fails the shutdown).
+	sweepArgs := service.ConvergeDNSArgs{
+		LeaseTable:  st.Identity.LeaseTable,
+		DNSZoneName: st.dnsZone(),
+		// Hostname is the converger's guard input (the sweep never
+		// self-heals — see SweepExpiredSlotRecords).
+		Hostname: st.Identity.Hostname,
+	}
+	if spec, err := loadInventorySpec(); err == nil && spec.DNSZoneName != "" {
+		sweepArgs.DNSZoneName = spec.DNSZoneName
+	}
+	if err := service.SweepExpiredSlotRecords(context.Background(), provider, sweepArgs); err != nil {
+		slog.Warn("drain-shutdown: expired-slot sweep failed; the renewal ticks own the retry",
+			"err", err)
+		fmt.Fprintf(os.Stderr, "WARNING: drain-shutdown: expired-slot sweep failed (%s); the renewal ticks own the retry\n", err)
+	}
+	return nil
+}
+
+// shutdownIsReboot reports whether the pending systemd shutdown is a
+// reboot (the job list carries reboot.target). The unit invokes this
+// from ExecStop, mid-transaction: list-jobs is the one query that
+// answers it without a second control-channel handshake.
+var shutdownIsReboot = func() (bool, error) {
+	out, err := runCommandWithEnv(context.Background(), nil, "systemctl", "list-jobs", "--no-legend", "--plain")
+	if err != nil {
+		return false, fmt.Errorf("systemctl list-jobs: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.Contains(string(out), "reboot.target"), nil
 }
 
 // selectDrainPeer picks the LIVE peer the replica drop runs against,
@@ -1539,7 +1671,14 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 	}
 
 	// 4. SYSTEM SHUTDOWN: stop accepting new queries gracefully.
-	if _, err := runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query", "SYSTEM SHUTDOWN"); err != nil {
+	// The shutdown drain skips this leg entirely (SkipServerShutdown):
+	// it runs as an ExecStop inside systemd's shutdown transaction,
+	// and the OS teardown that follows stops the server on its own.
+	if opts.SkipServerShutdown {
+		slog.Info("drain: server shutdown skipped (the systemd teardown owns it)",
+			"hostname", st.Identity.Hostname)
+		fmt.Println("drain: server shutdown skipped (the systemd teardown owns it)")
+	} else if _, err := runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query", "SYSTEM SHUTDOWN"); err != nil {
 		slog.Warn("WARNING: graceful shutdown failed; falling back to systemctl stop", "err", err)
 		_, _ = runCommand(drainCtx, "systemctl", "stop", "clickhouse-server")
 	} else {

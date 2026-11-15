@@ -105,7 +105,28 @@ func ConvergePeerDNS(ctx context.Context, provider port.Provider, args ConvergeD
 	if !ok {
 		return nil // guard logged
 	}
-	return c.converge(ctx, args)
+	c.selfHeal(ctx, args)
+	return c.sweep(ctx, args.LeaseTable)
+}
+
+// SweepExpiredSlotRecords releases the A record of every ordinal name
+// whose lease EXPIRED — the sweep half of the DNS convergence alone,
+// WITHOUT the self-heal upsert. The shutdown drain runs this as its
+// last act: the node's own record is already released (the drain did
+// it), so the upsert half must NOT run (it would re-create the record
+// the drain just deleted); sweeping the zone's other dead-holder
+// records is pure cleanup on the way out.
+//
+// Without it: a node terminating next to an undrained predecessor
+// (its drain could not dispatch) leaves that predecessor's stale
+// record until the next renewal tick elsewhere — up to 5 minutes of
+// schema-sync hangs the terminating node could have healed itself.
+func SweepExpiredSlotRecords(ctx context.Context, provider port.Provider, args ConvergeDNSArgs) error {
+	c, ok := newDNSConverger(ctx, provider, args)
+	if !ok {
+		return nil // guard logged
+	}
+	return c.sweep(ctx, args.LeaseTable)
 }
 
 // newDNSConverger builds the converger after the capability and zone
@@ -132,13 +153,13 @@ func newDNSConverger(ctx context.Context, provider port.Provider, args ConvergeD
 	}, true
 }
 
-// converge runs one pass: self-heal upsert, then the expired-slot
-// sweep over the live claims. The self-heal runs BEFORE the claims
-// listing — the node's own record must stay correct even when the
-// lease table is unreachable.
-func (c *dnsConverger) converge(ctx context.Context, args ConvergeDNSArgs) error {
-	c.selfHeal(ctx, args)
-	claims, err := c.activeClaims(ctx, args.LeaseTable)
+// sweep lists the live claims and releases the expired-slot records.
+// The self-heal ordering contract differs per entrypoint: the periodic
+// convergence self-heals FIRST (the node's own record must stay
+// correct even when the lease table is unreachable); the shutdown
+// sweep never self-heals (see SweepExpiredSlotRecords).
+func (c *dnsConverger) sweep(ctx context.Context, table string) error {
+	claims, err := c.activeClaims(ctx, table)
 	if err != nil {
 		// Best-effort: a listing outage must not abort the renewal.
 		slog.Warn("peer-dns: live-claims listing failed; expired-slot sweep skipped", "err", err)

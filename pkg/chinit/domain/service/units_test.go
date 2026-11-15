@@ -196,3 +196,42 @@ var _ = Describe("chinitUnits", func() {
 		})
 	})
 })
+
+var _ = Describe("shutdownDrainUnit", func() {
+	// The in-node shutdown drain unit (the fix for the 2026-11-15
+	// soak finding: reader scale-ins left stale DNS + lease residue
+	// because the SSM-dispatched drain races the agent's teardown, and
+	// a health-check termination never fires the hook at all). These
+	// specs pin the unit-content contract; the role gating lives in
+	// installShutdownDrain's switch (writers + readers only).
+
+	It("orders ExecStop after clickhouse-server so the drain runs against a live server", func() {
+		// The ordering IS the design: on shutdown systemd stops units
+		// in reverse dependency order, so After=clickhouse-server
+		// means this unit's ExecStop runs BEFORE the server stops —
+		// the peer drop and SYSTEM STOP queries need a live server.
+		u := (&Boot{Spec: &model.BootSpec{}}).shutdownDrainUnit()
+		Expect(u.Name).To(Equal("chinit-shutdown-drain.service"))
+		Expect(u.Content).To(ContainSubstring("After=network-online.target clickhouse-server.service"))
+	})
+
+	It("runs the drain-shutdown subcommand at ExecStop and stays quiescent at start", func() {
+		// ExecStart=/bin/true + RemainAfterExit=yes: the unit exists
+		// solely to be an active unit whose ExecStop systemd invokes
+		// during the shutdown transaction.
+		u := (&Boot{Spec: &model.BootSpec{}}).shutdownDrainUnit()
+		Expect(u.Content).To(ContainSubstring("ExecStart=/bin/true"))
+		Expect(u.Content).To(ContainSubstring("ExecStop=/usr/local/bin/chinit drain-shutdown"))
+		Expect(u.Content).To(ContainSubstring("RemainAfterExit=yes"))
+	})
+
+	It("bounds the drain under EC2's shutdown window", func() {
+		// The subcommand's own budget is 150s; the unit bound (170s)
+		// must sit ABOVE it so the wrapper never cuts the drain short,
+		// and both must stay under EC2's 180s API-driven window — a
+		// drain that overruns the window gets the instance killed
+		// mid-drain, the exact outcome the unit prevents.
+		u := (&Boot{Spec: &model.BootSpec{}}).shutdownDrainUnit()
+		Expect(u.Content).To(ContainSubstring("TimeoutStopSec=170"))
+	})
+})

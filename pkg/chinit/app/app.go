@@ -91,6 +91,8 @@ func Run(args []string) error {
 		return runSpotWatch(rest)
 	case "drain":
 		return runDrain(rest)
+	case "drain-shutdown":
+		return runDrainShutdown(rest)
 	case "version":
 		fmt.Printf("chinit %s\n", Version)
 		return nil
@@ -145,7 +147,8 @@ Usage:
   chinit orphaned-gc
   chinit backup-daily
   chinit spot-watch
-  chinit drain [-reason spot|termination-hook] [-timeout seconds]
+  chinit drain [-reason spot|shutdown|termination-hook] [-timeout seconds]
+  chinit drain-shutdown
   chinit version
 
 The spec is chinit.yaml (fetched with the config bundle when booted via

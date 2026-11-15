@@ -160,7 +160,12 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// 17. Spot watcher service (readers).
 		StepFunc("install_spot_watch", BestEffort, onceFatal, b.installSpotWatch),
 
-		// 18. boot-finished marker (health verification greps it).
+		// 18. In-node shutdown drain unit (writers + readers): the
+		// systemd stop-path drain — closes the scale-in/health-check/
+		// spot-deadline gaps the hook's SSM dispatch cannot reach.
+		StepFunc("install_shutdown_drain", BestEffort, onceFatal, b.installShutdownDrain),
+
+		// 19. boot-finished marker (health verification greps it).
 		StepFunc("boot_finished", Critical, onceFatal, func(ctx context.Context) error {
 			if err := os.MkdirAll(filepath.Dir(BootFinishedMarker), 0755); err != nil {
 				return err

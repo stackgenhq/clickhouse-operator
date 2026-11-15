@@ -367,6 +367,89 @@ WantedBy=multi-user.target
 	return nil
 }
 
+// installShutdownDrain writes the in-node shutdown drain unit
+// (writers + readers): chinit-shutdown-drain.service, whose ExecStop
+// runs `chinit drain-shutdown` when systemd tears the node down.
+//
+// Why a shutdown unit instead of relying on the ASG termination hook's
+// SSM dispatch alone: the OS shutdown path is the ONE signal every
+// termination mode goes through — ASG scale-in, EC2 health-check
+// replacement (which NEVER fires the hook), spot reclaim at the
+// deadline, operator stop. The hook's SSM dispatch also races the
+// agent's own teardown. systemd runs the drain from INSIDE the node:
+// the unit is ordered After=clickhouse-server.service, so on
+// shutdown (reverse dependency order) the drain runs FIRST while
+// ClickHouse is still up to serve the drain's peer drop and SYSTEM
+// STOP queries, then the server stops.
+//
+// Writers and readers ONLY (the ASG roles with a lease, a DNS record
+// and a replica registration to release): keepers hold no lease and
+// run no clickhouse-server; the backup replica survives reboots with
+// its identity — draining it on shutdown would drop a replica that
+// is coming right back (the subcommand's reboot guard covers the
+// reboot case for the ASG roles the same way).
+//
+// The unit is a no-op at start (ExecStart=/bin/true +
+// RemainAfterExit=yes): its ONLY purpose is to be "active" so systemd
+// runs ExecStop against it during the shutdown transaction. The
+// drain-shutdown subcommand carries the reboot guard (skip when
+// reboot.target is the pending job — identity survives a reboot) and
+// the deadline discipline (150s, bounded under EC2's window).
+// shutdownDrainUnit is the pure unit builder — split out so the
+// role-gating and unit-content contracts are testable without
+// executing systemctl (the matrix's test seam; installShutdownDrain
+// owns the install and enable calls).
+func (b *Boot) shutdownDrainUnit() system.UnitFile {
+	return system.UnitFile{
+		Name: "chinit-shutdown-drain.service",
+		Content: `[Unit]
+Description=In-node shutdown drain (chinit drain-shutdown)
+# After=clickhouse-server: on shutdown systemd stops units in reverse
+# dependency order — this unit's ExecStop runs BEFORE the server
+# stops, so the drain's peer drop and SYSTEM STOP queries have a
+# live server to talk to. Wants=network-online: the drain talks to
+# the lease table and DNS.
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/chinit drain-shutdown
+# The drain's own budget is 150s (the subcommand's constant); the
+# unit bound sits above it so the drain is never cut short by its
+# own wrapper — EC2's shutdown window (180s) remains the outer bound.
+TimeoutStopSec=170
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+`,
+	}
+}
+
+// installShutdownDrain writes the in-node shutdown drain unit
+// (writers + readers) and enables it.
+func (b *Boot) installShutdownDrain(ctx context.Context) error {
+	switch b.Spec.Role {
+	case model.RoleWriter, model.RoleReader:
+	default:
+		return nil
+	}
+	installer := system.NewUnitInstaller("/etc/systemd/system")
+	units := []system.UnitFile{b.shutdownDrainUnit()}
+	if _, err := installer.InstallUnits(units); err != nil {
+		return err
+	}
+	if out, err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("daemon-reload: %w: %s", err, out)
+	}
+	if out, err := runCommand(ctx, "systemctl", "enable", "--now", "chinit-shutdown-drain.service"); err != nil {
+		return fmt.Errorf("enable chinit-shutdown-drain: %w: %s", err, out)
+	}
+	return nil
+}
+
 // cloudWatchConfig is the pure config-shape builder configureCloudWatch
 // writes to disk — split out so the contracts (role gating, namespace
 // split, identity-label placement) are testable without executing

@@ -86,6 +86,9 @@ func (d *fakeDNSRegistrar) UpsertARecord(_ context.Context, req port.ARecordRequ
 
 func (d *fakeDNSRegistrar) DeleteARecord(_ context.Context, req port.ARecordRequest) error {
 	d.deletes = append(d.deletes, req)
+	if d.deleteFailNames[req.RecordName] {
+		return errors.New("route53 delete refused")
+	}
 	return nil
 }
 
@@ -206,6 +209,27 @@ var _ = Describe("ConvergePeerDNS", func() {
 				"writer-2": true,
 			}),
 				"a failing delete must not stop the sweep of the remaining expired slots")
+		})
+	})
+
+	Context("the sweep-only entrypoint (the shutdown drain's parting sweep)", func() {
+		It("releases expired slots without the self-heal upsert", func() {
+			lister := &fakeLeaseLister{claims: []port.Claim{
+				{Hostname: "writer-0", IP: "10.0.1.45"},
+				{Hostname: "writer-2", IP: "10.0.1.218"},
+				{Hostname: "writer-3", IP: "10.0.1.24"},
+			}}
+			dns := &fakeDNSRegistrar{zoneID: "Z07073102YAGFP019SAW"}
+			provider := &dnsClaimsProvider{lister, dns}
+
+			Expect(SweepExpiredSlotRecords(context.Background(), provider, convergeDNSArgs())).To(Succeed())
+
+			// NO upsert: the shutdown drain runs this AFTER releasing
+			// its own record — a self-heal would re-create it.
+			Expect(dns.upserts).To(BeEmpty())
+			// The expired slot still sweeps.
+			Expect(dns.deletes).To(HaveLen(1))
+			Expect(dns.deletes[0].RecordName).To(Equal("writer-1"))
 		})
 	})
 })
