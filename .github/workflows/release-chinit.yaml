@@ -3,10 +3,17 @@ name: Release chinit
 # Cross-builds the chinit binary (cmd/chinit) and publishes it as a
 # GitHub Release so node bootstrap (cloud-init user-data, packer
 # images) and humans can fetch a pinned binary:
-#   curl -fsSL https://github.com/<repo>/releases/download/chinit-v0.1.0/chinit-linux-arm64
+#   curl -fsSL https://github.com/<repo>/releases/download/v0.2.0/chinit-linux-arm64
 #
-# Trigger: pushing a tag `chinit-v*`. The prefix keeps chinit releases
-# namespaced apart from operator (v0.27.x) tags.
+# Trigger: pushing a tag `v0.*`. The bare semver tag keeps chinit
+# releases namespaced apart from the operator's release-* tags while
+# satisfying GoReleaser OSS (CURRENT_TAG must be valid semver and exist
+# against HEAD — the v0.2.0 release-gate findings).
+#
+# Tags are build-only by design: every commit lands on master only after
+# its suites pass (pre-push runs the full chinit gate), so re-running
+# them on the tag adds latency without new signal. CI on the tag
+# validates only what the tag itself can change — the goreleaser build.
 #
 # Artifacts per release (produced by GoReleaser, see .goreleaser.chinit.yaml):
 #   chinit-<os>-<arch>  stripped static binaries (linux/arm64+amd64,
@@ -20,43 +27,14 @@ name: Release chinit
 on:
   push:
     tags:
-      # Bare semver: GoReleaser OSS publishes the release under the
-      # CURRENT_TAG ref, which must be valid semver — the chinit-v
-      # prefix never satisfies both that and the git-state check (the
-      # v0.2.0 release-gate findings). v0.* cannot collide with the
-      # operator's release-* tags or any other workflow trigger.
       - "v0.*"
 
 permissions:
   contents: write # create the Release + upload artifacts
 
 jobs:
-  test:
-    name: Test (release gate)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout (tagged tree)
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.sum
-
-      - name: Vet + test
-        run: |
-          # A tag that fails its suites is worse than no release: these
-          # binaries are what cloud-init pipes straight into
-          # /usr/local/bin and runs as root on every node boot.
-          go vet ./pkg/chinit/... ./cmd/chinit/...
-          go test ./pkg/chinit/...
-
   release:
     name: Build & publish chinit release
-    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
