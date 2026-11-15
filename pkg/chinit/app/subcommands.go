@@ -1487,7 +1487,11 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 			ZoneID:     st.Identity.ZoneID,
 			ZoneName:   st.dnsZone(),
 			RecordName: st.Identity.Hostname,
-			TTL:        60,
+			// IP is REQUIRED on Route53 DELETE (the exact value match
+			// the API demands); empty falls back to a live-value list
+			// in the provider, but the settled identity knows the IP.
+			IP:  st.Identity.PrivateIP,
+			TTL: 60,
 		}); err != nil {
 			slog.Warn("WARNING: drain DNS release failed",
 				"record", st.Identity.Hostname,

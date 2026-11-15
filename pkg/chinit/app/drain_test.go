@@ -357,6 +357,7 @@ func drainer() *nodeState {
 		Role:        model.RoleWriter,
 		Hostname:    "writer-1",
 		InstanceID:  "i-w1",
+		PrivateIP:   "10.0.1.21",
 		ClusterName: "logexplorer",
 		DNSZone:     "ch.internal",
 		CRName:      "01-1",
@@ -646,6 +647,23 @@ var _ = Describe("drain", func() {
 			}
 		}
 		Expect(clientCalls).To(Equal(3), "stop queues, stop sends and shutdown all go through the client")
+	})
+
+	It("passes the node's IP on the DNS delete (Route53 exact-value DELETE)", func() {
+		// The live 0.2.7 drain finding: Route53 rejects a DELETE
+		// without ResourceRecords ("Expected exactly one of
+		// [AliasTarget, all of [TTL, and ResourceRecords]]") — the
+		// A record lingered after scale-in, so peers kept resolving
+		// the dead node's IP. The settled identity's PrivateIP is
+		// the exact value the record was registered with.
+		st := drainer()
+		f.lister.claims = []port.Claim{{Hostname: "writer-0"}}
+		provider := &drainProvider{name: "aws", lister: f.lister, claimer: f.claimer, dns: f.dns}
+
+		Expect(drain(context.Background(), st, provider, drainOptions{DeadlineSeconds: 240, Reason: drainReasonTerminationHook})).To(Succeed())
+
+		Expect(f.dns.deletes).To(HaveLen(1))
+		Expect(f.dns.deletes[0].IP).NotTo(BeEmpty(), "the DELETE must carry the record value Route53 demands")
 	})
 
 	It("keeps draining with no capabilities at all (writer-0 fallback)", func() {

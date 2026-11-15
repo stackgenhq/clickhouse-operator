@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	route53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 
@@ -32,6 +33,7 @@ func errorsAs(err error, target interface{}) bool { return errors.As(err, target
 type Route53API interface {
 	ListHostedZonesByName(ctx context.Context, in *route53.ListHostedZonesByNameInput, opts ...func(*route53.Options)) (*route53.ListHostedZonesByNameOutput, error)
 	ChangeResourceRecordSets(ctx context.Context, in *route53.ChangeResourceRecordSetsInput, opts ...func(*route53.Options)) (*route53.ChangeResourceRecordSetsOutput, error)
+	ListResourceRecordSets(ctx context.Context, in *route53.ListResourceRecordSetsInput, opts ...func(*route53.Options)) (*route53.ListResourceRecordSetsOutput, error)
 }
 
 // Route53Registrar manages the node's private-zone A record.
@@ -135,25 +137,73 @@ func (r *Route53Registrar) UpsertARecord(ctx context.Context, req chinitport.ARe
 }
 
 // DeleteARecord removes the node's A record (drain/termination).
+//
+// Route53 DELETE requires the EXACT ResourceRecords values of the live
+// record ("Expected exactly one of [AliasTarget, all of [TTL, and
+// ResourceRecords]..." — the live 0.2.7 finding: a valueless DELETE is
+// rejected and the A record lingers after scale-in, so peers keep
+// resolving a dead node's IP). The request's IP is used when present;
+// otherwise the live set is listed by name and deleted value-by-value
+// (the drain-time record may have been re-registered under a different
+// IP by a replacement node that already claimed the ordinal).
 func (r *Route53Registrar) DeleteARecord(ctx context.Context, req chinitport.ARecordRequest) error {
 	client, err := r.clientOrInit(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: awsString(req.ZoneID),
-		ChangeBatch: &route53types.ChangeBatch{
-			Changes: []route53types.Change{{
-				Action: route53types.ChangeActionDelete,
-				ResourceRecordSet: &route53types.ResourceRecordSet{
-					Name: awsString(fqdn(req.RecordName, req.ZoneName)),
-					Type: route53types.RRTypeA,
-					TTL:  int64Ptr(req.TTL),
-				},
-			}},
-		},
-	})
-	return err
+	recordName := fqdn(req.RecordName, req.ZoneName)
+	values := []string{}
+	if req.IP != "" {
+		values = []string{req.IP}
+	} else {
+		// List the live values: a DELETE without the exact value set is
+		// rejected, and the drain's caller does not always know the IP
+		// a re-registration may have left behind.
+		out, lerr := client.ListResourceRecordSets(ctx, &route53.ListResourceRecordSetsInput{
+			HostedZoneId:    awsString(req.ZoneID),
+			StartRecordName: awsString(recordName),
+			StartRecordType: route53types.RRTypeA,
+			MaxItems:        int32Ptr(1),
+		})
+		if lerr != nil {
+			return lerr
+		}
+		for _, rs := range out.ResourceRecordSets {
+			if aws.ToString(rs.Name) != recordName || rs.Type != route53types.RRTypeA {
+				continue
+			}
+			for _, rr := range rs.ResourceRecords {
+				values = append(values, aws.ToString(rr.Value))
+			}
+		}
+		if len(values) == 0 {
+			return nil // nothing to delete — the record is already gone
+		}
+	}
+	for _, v := range values {
+		_, err = client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: awsString(req.ZoneID),
+			ChangeBatch: &route53types.ChangeBatch{
+				Changes: []route53types.Change{{
+					Action: route53types.ChangeActionDelete,
+					ResourceRecordSet: &route53types.ResourceRecordSet{
+						Name:            awsString(recordName),
+						Type:            route53types.RRTypeA,
+						TTL:             int64Ptr(req.TTL),
+						ResourceRecords: []route53types.ResourceRecord{{Value: awsString(v)}},
+					},
+				}},
+			},
+		})
+		if err != nil {
+			// A concurrent replacement may have re-registered the
+			// record under a different value: deleting the stale one
+			// fails with InvalidChangeBatch/NotFound — not a drain
+			// failure, the record is managed again.
+			return err
+		}
+	}
+	return nil
 }
 
 // fqdn joins the short hostname and the zone name.
@@ -169,3 +219,6 @@ func fqdn(name, zone string) string {
 
 // int64Ptr is the numeric pointer helper.
 func int64Ptr(v int) *int64 { return &[]int64{int64(v)}[0] }
+
+// int32Ptr is the Route53 MaxItems helper.
+func int32Ptr(v int32) *int32 { return &v }
