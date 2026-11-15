@@ -25,6 +25,7 @@ import (
 	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
+
 // errorsAs is errors.As (indirection keeps the dynamodb.go file's SDK
 // imports to the two it needs).
 func errorsAs(err error, target interface{}) bool { return errors.As(err, target) }
@@ -146,64 +147,135 @@ func (r *Route53Registrar) UpsertARecord(ctx context.Context, req chinitport.ARe
 // otherwise the live set is listed by name and deleted value-by-value
 // (the drain-time record may have been re-registered under a different
 // IP by a replacement node that already claimed the ordinal).
+//
+// A requested-IP delete that FAILS falls back to the live value set:
+// a previous holder's drain may never have released the name (an
+// EC2-health-check termination whose drain could not dispatch leaves
+// the A record pointing at the OLD instance's IP — the live
+// 2026-11-15 finding: writer-1.ch-int-dev.clickhouse.internal kept a
+// dead 10.0.1.236 for hours, hanging every clusterAllReplicas fan-out
+// and schema-sync on the fleet). The terminating node owns the ordinal
+// for the hook's duration, so any value under this name is stale by
+// construction.
 func (r *Route53Registrar) DeleteARecord(ctx context.Context, req chinitport.ARecordRequest) error {
 	client, err := r.clientOrInit(ctx)
 	if err != nil {
 		return err
 	}
-	recordName := fqdn(req.RecordName, req.ZoneName)
-	values := []string{}
-	if req.IP != "" {
-		values = []string{req.IP}
-	} else {
-		// List the live values: a DELETE without the exact value set is
-		// rejected, and the drain's caller does not always know the IP
-		// a re-registration may have left behind.
-		out, lerr := client.ListResourceRecordSets(ctx, &route53.ListResourceRecordSetsInput{
-			HostedZoneId:    awsString(req.ZoneID),
-			StartRecordName: awsString(recordName),
-			StartRecordType: route53types.RRTypeA,
-			MaxItems:        int32Ptr(1),
-		})
-		if lerr != nil {
-			return lerr
-		}
-		for _, rs := range out.ResourceRecordSets {
-			if aws.ToString(rs.Name) != recordName || rs.Type != route53types.RRTypeA {
-				continue
-			}
-			for _, rr := range rs.ResourceRecords {
-				values = append(values, aws.ToString(rr.Value))
-			}
-		}
-		if len(values) == 0 {
-			return nil // nothing to delete — the record is already gone
-		}
+	d := newRecordDeleter(r, client, req)
+	values, err := d.targetValues(ctx)
+	if err != nil {
+		return err
+	}
+	if len(values) == 0 {
+		return nil // nothing to delete — the record is already gone
 	}
 	for _, v := range values {
-		_, err = client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
-			HostedZoneId: awsString(req.ZoneID),
-			ChangeBatch: &route53types.ChangeBatch{
-				Changes: []route53types.Change{{
-					Action: route53types.ChangeActionDelete,
-					ResourceRecordSet: &route53types.ResourceRecordSet{
-						Name:            awsString(recordName),
-						Type:            route53types.RRTypeA,
-						TTL:             int64Ptr(req.TTL),
-						ResourceRecords: []route53types.ResourceRecord{{Value: awsString(v)}},
-					},
-				}},
-			},
-		})
-		if err != nil {
-			// A concurrent replacement may have re-registered the
-			// record under a different value: deleting the stale one
-			// fails with InvalidChangeBatch/NotFound — not a drain
-			// failure, the record is managed again.
+		if err := d.deleteValue(ctx, v); err != nil {
+			// The value may not match the live record (a previous
+			// holder's stale record): sweep the LIVE value set.
+			return d.fallbackToLiveValues(ctx, err)
+		}
+	}
+	return nil
+}
+
+// recordDeleter owns one record's DELETE flow: the requested values,
+// the single-value delete call, and the stale-value fallback. A value
+// type over the registrar's client so the fallback lives at the same
+// boundary as the primary delete (one place knows the DELETE shape).
+type recordDeleter struct {
+	// registrar resolves the record's FQDN (name + zone joining).
+	registrar *Route53Registrar
+	// client is the SDK surface (the tests' fake).
+	client Route53API
+	// req is the caller's delete request (zone, name, requested IP).
+	req chinitport.ARecordRequest
+}
+
+// newRecordDeleter binds the delete flow's collaborators.
+func newRecordDeleter(registrar *Route53Registrar, client Route53API, req chinitport.ARecordRequest) *recordDeleter {
+	return &recordDeleter{registrar: registrar, client: client, req: req}
+}
+
+// targetValues names the values the primary delete attempts: the
+// requested IP when the caller knows it, the live set otherwise (a
+// DELETE without the exact value set is rejected).
+func (d *recordDeleter) targetValues(ctx context.Context) ([]string, error) {
+	if d.req.IP != "" {
+		return []string{d.req.IP}, nil
+	}
+	return d.registrar.listRecordValues(ctx, d.client, d.req.ZoneID, d.recordName())
+}
+
+// deleteValue removes one value from the named record.
+func (d *recordDeleter) deleteValue(ctx context.Context, value string) error {
+	_, err := d.client.ChangeResourceRecordSets(ctx, &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: awsString(d.req.ZoneID),
+		ChangeBatch: &route53types.ChangeBatch{
+			Changes: []route53types.Change{{
+				Action: route53types.ChangeActionDelete,
+				ResourceRecordSet: &route53types.ResourceRecordSet{
+					Name:            awsString(d.recordName()),
+					Type:            route53types.RRTypeA,
+					TTL:             int64Ptr(d.req.TTL),
+					ResourceRecords: []route53types.ResourceRecord{{Value: awsString(value)}},
+				},
+			}},
+		},
+	})
+	return err
+}
+
+// fallbackToLiveValues is the requested-value-delete failure path: the
+// record may carry a stale previous holder's value the request cannot
+// name. It sweeps the LIVE value set by name; the already-failed value
+// is not retried. primaryErr is returned unchanged when the fallback
+// itself cannot proceed (the original failure is the truth).
+func (d *recordDeleter) fallbackToLiveValues(ctx context.Context, primaryErr error) error {
+	live, err := d.registrar.listRecordValues(ctx, d.client, d.req.ZoneID, d.recordName())
+	if err != nil {
+		return primaryErr // the original delete failure is the truth
+	}
+	if len(live) == 0 {
+		return nil // a concurrent cleanup won the race
+	}
+	for _, v := range live {
+		if err := d.deleteValue(ctx, v); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// recordName is the record's FQDN.
+func (d *recordDeleter) recordName() string {
+	return fqdn(d.req.RecordName, d.req.ZoneName)
+}
+
+// listRecordValues returns the A-record values a name currently holds
+// (empty when the record is gone) — the no-IP delete's target set and
+// the stale-value fallback's sweep set.
+func (r *Route53Registrar) listRecordValues(ctx context.Context, client Route53API, zoneID, recordName string) ([]string, error) {
+	out, err := client.ListResourceRecordSets(ctx, &route53.ListResourceRecordSetsInput{
+		HostedZoneId:    awsString(zoneID),
+		StartRecordName: awsString(recordName),
+		StartRecordType: route53types.RRTypeA,
+		MaxItems:        int32Ptr(1),
+	})
+	if err != nil {
+		return nil, err
+	}
+	values := []string{}
+	for _, rs := range out.ResourceRecordSets {
+		if aws.ToString(rs.Name) != recordName || rs.Type != route53types.RRTypeA {
+			continue
+		}
+		for _, rr := range rs.ResourceRecords {
+			values = append(values, aws.ToString(rr.Value))
+		}
+	}
+	return values, nil
 }
 
 // fqdn joins the short hostname and the zone name.

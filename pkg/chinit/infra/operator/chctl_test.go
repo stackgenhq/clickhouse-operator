@@ -1505,8 +1505,12 @@ func TestRenderNodePlanMachineryUserAbsent(t *testing.T) {
 		require.NotContains(t, file.Content, "clickhouse_operator",
 			"machinery user in %s would crash the node's users.d load (Code 347)", path)
 	}
-	// The deployment's own users file still renders.
-	require.Contains(t, plan["/etc/clickhouse-server/users.d/chop-generated-users.xml"].Content, "<default>")
+	// The deployment's own users file renders as the single owner: the
+	// generator's users file is dropped from the plan (single-owner
+	// users.d — the sha256("default") stub and ::/0 networks of the
+	// generator's version never install next to the real hashes).
+	require.Contains(t, plan["/etc/clickhouse-server/users.d/z_chctl-users.xml"].Content, "<default>")
+	require.NotContains(t, plan, "/etc/clickhouse-server/users.d/chop-generated-users.xml")
 }
 
 // TestConfigRendererUserPasswordInjectionOverridesSpec asserts the core
@@ -1982,6 +1986,14 @@ func TestRenderNodeComposesTheThreeRenders(t *testing.T) {
 		// before emission (its profile is operator-shipped on-cluster
 		// only — Code 347 off-cluster), so the composed expectation is
 		// exactly what the renderer emits, no post-guard.
+		//
+		// Single-owner users.d: when the UsersRenderer emits
+		// z_chctl-users.xml, the generator's chop-generated-users.xml
+		// is dropped from the plan — the composed expectation drops it
+		// the same way.
+		if len(usersFiles) > 0 && file.Group == "users" && filepath.Base(file.Path) == "chop-generated-users.xml" {
+			continue
+		}
 		dir := "/etc/clickhouse-server/config.d"
 		if file.Group == "users" {
 			dir = "/etc/clickhouse-server/users.d"
@@ -2002,8 +2014,13 @@ func TestRenderNodeComposesTheThreeRenders(t *testing.T) {
 		require.Equal(t, expected.Group, actual.Group, "group of %s", path)
 	}
 
+	// Single-owner users.d: the generator's users file is absent from
+	// the plan (the stale-manifest prune removes it from live nodes).
+	require.NotContains(t, plan, "/etc/clickhouse-server/users.d/chop-generated-users.xml",
+		"the generator's users file must not install next to z_chctl-users.xml")
+
 	// The credential split: remote_servers with an injected password and
-	// every users file stay 0640; the rest (macros, zookeeper,
+	// the users file stay 0640; the rest (macros, zookeeper,
 	// settings, profiles, the files: entry) is world-readable 0644.
 	require.Equal(t, os.FileMode(0o640), plan["/etc/clickhouse-server/config.d/chop-generated-remote_servers.xml"].Mode,
 		"remote_servers with an injected password must be 0640")
@@ -2011,7 +2028,6 @@ func TestRenderNodeComposesTheThreeRenders(t *testing.T) {
 	require.Equal(t, os.FileMode(0o644), plan["/etc/clickhouse-server/config.d/chop-generated-zookeeper.xml"].Mode)
 	require.Equal(t, os.FileMode(0o644), plan["/etc/clickhouse-server/config.d/server-prometheus.xml"].Mode,
 		"spec files: entry without credentials is ordinary configuration: 0644")
-	require.Equal(t, os.FileMode(0o640), plan["/etc/clickhouse-server/users.d/chop-generated-users.xml"].Mode)
 	require.Equal(t, os.FileMode(0o640), plan["/etc/clickhouse-server/users.d/z_chctl-users.xml"].Mode)
 
 	// Every section the node needs is present in ONE plan.
@@ -2021,7 +2037,6 @@ func TestRenderNodeComposesTheThreeRenders(t *testing.T) {
 		"chop-generated-settings.xml",
 		"chop-generated-profiles.xml",
 		"chop-generated-remote_servers.xml",
-		"chop-generated-users.xml",
 		"z_chctl-users.xml",
 		"server-prometheus.xml",
 	} {
@@ -2281,6 +2296,67 @@ func TestRenderNodePruneManifestOnly(t *testing.T) {
 	require.Contains(t, string(data), "chop-generated-macros.xml")
 	require.NotContains(t, string(data), "network.xml")
 	require.NotContains(t, string(data), "chop-generated-handmade.xml")
+}
+
+// TestRenderNodeSingleOwnerUsersDir asserts the users.d single-owner
+// contract: when the spec declares users (the UsersRenderer emits
+// z_chctl-users.xml with the Secrets-Manager hashes), the generator's
+// users-group file is ABSENT from the plan — its sha256("default")
+// stub, unresolved passwordFrom element and ::/0 networks must never
+// install next to the real credentials (the live 2026-11-15 finding:
+// Code 516 on every local client once the bogus hashes won the merge).
+func TestRenderNodeSingleOwnerUsersDir(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	plan, _ := renderNodePlan(t, port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    "/etc/clickhouse-server/config.d",
+		UsersDir:     "/etc/clickhouse-server/users.d",
+	})
+
+	require.Contains(t, plan, "/etc/clickhouse-server/users.d/z_chctl-users.xml",
+		"the spec's users file is the single owner of users.d")
+	require.NotContains(t, plan, "/etc/clickhouse-server/users.d/chop-generated-users.xml",
+		"the generator's users file must not install when z_chctl-users.xml renders")
+
+	// The installed tree carries neither the raw reference element nor
+	// the ::/0 networks the generator's version leaked.
+	usersXML := plan["/etc/clickhouse-server/users.d/z_chctl-users.xml"].Content
+	require.NotContains(t, usersXML, "passwordFrom")
+	require.NotContains(t, usersXML, "::/0")
+}
+
+// TestRenderNodeSingleOwnerPrunesPriorGeneratorUsers asserts the
+// migration path: a node whose previous render installed the
+// generator's users file has it PRUNED on the next render — the
+// stale-manifest discipline removes the conflicting credential file
+// from live nodes without a hand-edit.
+func TestRenderNodeSingleOwnerPrunesPriorGeneratorUsers(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	usersDir := t.TempDir()
+	base := port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    t.TempDir(),
+		UsersDir:     usersDir,
+		OwnerUser:    fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	}
+
+	// Simulate the pre-fix node: the generator's users file sits in
+	// users.d and IS manifest-tracked (a prior render installed it).
+	prior := filepath.Join(usersDir, "chop-generated-users.xml")
+	require.NoError(t, os.WriteFile(prior, []byte("<clickhouse><users/></clickhouse>"), 0o644))
+	manifestPath := filepath.Join(usersDir, renderNodeManifestName)
+	require.NoError(t, os.WriteFile(manifestPath, []byte("chop-generated-users.xml\n"), 0o644))
+
+	result, err := newTestNodeRenderer().RenderNode(context.Background(), base)
+	require.NoError(t, err)
+	require.Contains(t, result.Pruned, prior,
+		"a prior render's generator users file is a stale manifest entry once the render stops producing it")
+	require.NoFileExists(t, prior,
+		"the conflicting credential file must be gone after the single-owner render")
+	require.FileExists(t, filepath.Join(usersDir, "z_chctl-users.xml"),
+		"the single-owner users file installs")
 }
 
 // TestRenderNodeKeeperSingleFile asserts the keeper flow: ONE merged

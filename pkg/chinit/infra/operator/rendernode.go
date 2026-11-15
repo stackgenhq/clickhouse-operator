@@ -239,7 +239,46 @@ func (r *NodeRenderer) renderCHIPlan(ctx context.Context, request port.RenderNod
 	if err != nil {
 		return nil, err
 	}
-	return append(plan, usersPlan...), nil
+	return append(r.dropGeneratorUsersFile(plan, usersPlan), usersPlan...), nil
+}
+
+// dropGeneratorUsersFile applies the single-owner users.d contract:
+// when the UsersRenderer produced the spec's users file
+// (z_chctl-users.xml), the generator's chop-generated-users.xml must
+// not join the plan. Both describe the same accounts, and the
+// generator's version carries the normalizer's default
+// password_sha256_hex (hash("default")) alongside unresolved
+// passwordFrom elements and ::/0 networks — merged into ClickHouse's
+// config layering those leak a bogus credential candidate and strip
+// the allowlist. The stale-manifest prune removes the generator file
+// from live nodes on the next render.
+// Without it: local clickhouse-client auth fails with Code 516 for
+// every user (the live 2026-11-15 finding: the generator's
+// sha256("default") stub and the Secrets-Manager hashes fought the
+// config merge on every node).
+//
+// Profiles and quotas of the same users group stay: the spec's
+// profiles ride z_chctl-users.xml, quotas do not, and the generator's
+// files are content-identical for the shared sections.
+func (r *NodeRenderer) dropGeneratorUsersFile(plan []port.RenderNodeFile, usersPlan []port.RenderNodeFile) []port.RenderNodeFile {
+	if len(usersPlan) == 0 {
+		return plan // no users section: the generator's files stand in
+	}
+	filtered := make([]port.RenderNodeFile, 0, len(plan))
+	for _, file := range plan {
+		if isGeneratorUsersFile(file) {
+			continue
+		}
+		filtered = append(filtered, file)
+	}
+	return filtered
+}
+
+// isGeneratorUsersFile reports whether a plan entry is the generator's
+// credential-bearing users file — the one file the single-owner
+// contract drops.
+func isGeneratorUsersFile(file port.RenderNodeFile) bool {
+	return file.Group == "users" && filepath.Base(file.Path) == "chop-generated-users.xml"
 }
 
 // isCredentialFile reports whether the rendered file carries

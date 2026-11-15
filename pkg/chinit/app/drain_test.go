@@ -130,6 +130,12 @@ func (p *drainProvider) ReleaseLease(ctx context.Context, req port.ReleaseReques
 }
 
 func (p *drainProvider) ResolveZoneID(ctx context.Context, zone string) (string, error) {
+	if p.dns == nil {
+		// The lease-renew fixtures build providers without the DNS
+		// capability; the renewal's DNS convergence treats the nil
+		// registrar as the documented no-op degradation.
+		return "", nil
+	}
 	return p.dns.ResolveZoneID(ctx, zone)
 }
 
@@ -184,14 +190,19 @@ func (c *drainClaimer) ReleaseLease(_ context.Context, req port.ReleaseRequest) 
 	return nil
 }
 
-// drainDNS records the A-record delete.
+// drainDNS records the A-record delete and (for the lease-renew DNS
+// convergence) the self-heal upserts.
 type drainDNS struct {
 	deletes []port.ARecordRequest
+	upserts []port.ARecordRequest
 }
 
 func (d *drainDNS) ResolveZoneID(context.Context, string) (string, error) { return "z-1", nil }
 
-func (d *drainDNS) UpsertARecord(context.Context, port.ARecordRequest) error { return nil }
+func (d *drainDNS) UpsertARecord(_ context.Context, req port.ARecordRequest) error {
+	d.upserts = append(d.upserts, req)
+	return nil
+}
 
 func (d *drainDNS) DeleteARecord(_ context.Context, req port.ARecordRequest) error {
 	d.deletes = append(d.deletes, req)

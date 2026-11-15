@@ -596,6 +596,22 @@ func runLeaseRenew(args []string) error {
 		if err := service.ConvergePeerHosts(ctx, provider, args); err != nil {
 			slog.Warn("lease-renew: peer-hosts convergence failed", "err", err)
 		}
+		// DNS convergence on the same tick: self-upsert plus the
+		// expired-slot record sweep (best-effort, same contract).
+		// Keepers never reach this path; static nodes (backup) have no
+		// lease and are excluded above.
+		dnsArgs := service.ConvergeDNSArgs{
+			LeaseTable:  st.Identity.LeaseTable,
+			DNSZoneName: st.dnsZone(),
+			Hostname:    st.Identity.Hostname,
+			PrivateIP:   st.Identity.PrivateIP,
+		}
+		if spec, err := loadInventorySpec(); err == nil && spec.DNSZoneName != "" {
+			dnsArgs.DNSZoneName = spec.DNSZoneName
+		}
+		if err := service.ConvergePeerDNS(ctx, provider, dnsArgs); err != nil {
+			slog.Warn("lease-renew: peer-dns convergence failed", "err", err)
+		}
 	}
 	return nil
 }

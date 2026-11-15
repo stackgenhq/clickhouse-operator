@@ -218,6 +218,64 @@ var _ = Describe("runLeaseRenew", func() {
 			Expect(string(data)).To(ContainSubstring("127.0.0.1 localhost"))
 		})
 	})
+
+	// The renewal also converges the private zone's server-role A
+	// records — the 2026-11-15 stale-record finding's durable fix: a
+	// writer terminated by an EC2 health check never ran its drain
+	// (SSM cannot dispatch to a stopping instance) and its record kept
+	// a dead IP for hours, hanging every clusterAllReplicas fan-out
+	// and schema-sync on the fleet. The every-5-minute renewal is the
+	// convergence point: self upsert + the expired-slot sweep.
+	Context("peer-dns convergence", func() {
+		It("self-heals its own record and releases the expired slot", func() {
+			statePath := writeLeaseState(model.NodeIdentity{
+				Role:        model.RoleWriter,
+				Hostname:    "writer-2",
+				InstanceID:  "i-w2",
+				PrivateIP:   "10.0.1.218",
+				ClusterName: "logexplorer",
+				DNSZone:     "ch.internal",
+				LeaseTable:  "node-claims",
+			})
+			lister := &recordingLister{claims: []chinitport.Claim{
+				{Hostname: "writer-0", IP: "10.0.1.45", InstanceID: "i-w0"},
+				{Hostname: "writer-2", IP: "10.0.1.218", InstanceID: "i-w2"},
+			}}
+			dns := &drainDNS{}
+			origBuild := buildProvider
+			buildProvider = func(string, string) (chinitport.Provider, error) {
+				return &drainProvider{name: "aws", claimer: &drainClaimer{}, lister: lister, dns: dns}, nil
+			}
+			DeferCleanup(func() { buildProvider = origBuild })
+
+			Expect(runLeaseRenew([]string{"-state", statePath})).To(Succeed())
+
+			// Self-heal: the node's own record is upserted.
+			Expect(dns.upserts).To(HaveLen(1))
+			Expect(dns.upserts[0].RecordName).To(Equal("writer-2"))
+
+			// The expired slot inside the claimed space: writer-1.
+			Expect(dns.deletes).To(Equal([]chinitport.ARecordRequest{
+				{
+					ZoneID:     "z-1",
+					ZoneName:   "ch.internal",
+					RecordName: "writer-1",
+					TTL:        60,
+				},
+			}))
+		})
+
+		It("is a no-op for keepers (no lease to renew through)", func() {
+			statePath := writeLeaseState(model.NodeIdentity{
+				Role:        model.RoleKeeper,
+				Hostname:    "keeper-0",
+				InstanceID:  "i-k0",
+				ClusterName: "logexplorer",
+				DNSZone:     "ch.internal",
+			})
+			Expect(runLeaseRenew([]string{"-state", statePath})).NotTo(Succeed())
+		})
+	})
 })
 
 // recordingLister is the lease-listing fake for the renewal specs: it
