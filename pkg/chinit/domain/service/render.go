@@ -545,10 +545,40 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 		}
 		out, err := execClient(ctx, adminPw, s)
 		if err != nil {
-			// Existing-object conflicts are the expected convergence
-			// case (REPLICA_ALREADY_EXISTS / a table the node already
-			// carries): log and continue — the statement set is
-			// independent per object.
+			// REPLICA_ALREADY_EXISTS (Code 253) is the NORMAL churn
+			// case: this node's replica name matches a znode left by
+			// its predecessor (the recycled-ordinal generation), and
+			// CREATE refuses to attach over it — the statement logs
+			// and CONTINUES, the table never materializes, and the
+			// fleet converges on nothing (the live 2026-11-15
+			// finding: 6 of 7 statements failed this way on every
+			// churned writer while the boot printed "1 applied"). The
+			// remedy is the drop-then-retry the drain and health-gate
+			// paths already use: SYSTEM DROP REPLICA '<name>' FROM
+			// ZKPATH '<path>' clears the node's OWN stale
+			// registration (parts/queue znodes included — safe on a
+			// fresh disk whose parts do not exist), and the retried
+			// CREATE registers clean.
+			if strings.Contains(out, "253") || strings.Contains(err.Error(), "253") {
+				if tablePath, replicaName := ddlReplicaIdentity(s, b.Identity.Hostname); tablePath != "" {
+					dropSQL := fmt.Sprintf("SYSTEM DROP REPLICA '%s' FROM ZKPATH '%s'", replicaName, tablePath)
+					if dOut, dErr := execClient(ctx, adminPw, dropSQL); dErr != nil {
+						fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL stale-replica drop failed for %s: %v: %s\n", tablePath, dErr, strings.TrimSpace(dOut))
+					} else if rOut, rErr := execClient(ctx, adminPw, s); rErr != nil {
+						fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed after drop (continuing): %v: %s\n", rErr, strings.TrimSpace(rOut))
+						continue
+					} else {
+						created++
+						fmt.Printf("schema bootstrap: %s re-created after dropping stale znode\n", tablePath)
+						continue
+					}
+				}
+			}
+			// Other failures (a table the node already carries via
+			// normal replication — TABLE_EXISTS — or transient errors)
+			// log and continue: the statement set is independent per
+			// object, and the schema-sync unit and health gate remain
+			// the heal paths.
 			fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed (continuing): %v: %s\n", err, strings.TrimSpace(out))
 			continue
 		}
@@ -556,6 +586,36 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	}
 	fmt.Printf("schema bootstrap: %d statement(s) applied from %s\n", created, ddlPath)
 	return nil
+}
+
+// ddlReplicaIdentity extracts the keeper path and replica name from one
+// CREATE ... <ReplicatedEngine>('<zk-path>', '{replica}' | 'name') and
+// the boot's settled hostname. Empty path answers "not a replicated
+// CREATE" (the queue table, the MVs) — the caller's conflict-retry only
+// applies to replicated tables. The '{replica}' macro form substitutes
+// the hostname (the macros config renders per node); a literal replica
+// name is taken as-is.
+func ddlReplicaIdentity(stmt, hostname string) (path, replica string) {
+	// The engine line: <Engine>('/clickhouse/tables/01/events', '{replica}')
+	open := strings.Index(stmt, "('/clickhouse/tables/")
+	if open < 0 {
+		return "", ""
+	}
+	rest := stmt[open+1:]
+	end := strings.Index(rest, "')")
+	if end < 0 {
+		return "", ""
+	}
+	parts := strings.SplitN(rest[:end], ",", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+	path = strings.Trim(strings.TrimSpace(parts[0]), "'\"")
+	replica = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+	if replica == "{replica}" {
+		replica = hostname
+	}
+	return path, replica
 }
 
 // splitSQLStatements splits a DDL file into statements on top-level

@@ -105,3 +105,26 @@ func splitLinesFor(stmt string) []string {
 	out = append(out, acc)
 	return out
 }
+
+
+var _ = Describe("ddlReplicaIdentity", func() {
+	It("extracts path and hostname from the macro form", func() {
+		stmt := `CREATE TABLE IF NOT EXISTS default.events (timestamp DateTime64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/01/events', '{replica}') ORDER BY tuple()`
+		path, replica := ddlReplicaIdentity(stmt, "writer-0")
+		Expect(path).To(Equal("/clickhouse/tables/01/events"))
+		Expect(replica).To(Equal("writer-0"))
+	})
+
+	It("extracts a literal replica name as-is", func() {
+		stmt := `CREATE TABLE x.y ENGINE = ReplicatedSummingMergeTree('/clickhouse/tables/01/hourly', 'reader-2') ORDER BY tuple()`
+		path, replica := ddlReplicaIdentity(stmt, "writer-0")
+		Expect(path).To(Equal("/clickhouse/tables/01/hourly"))
+		Expect(replica).To(Equal("reader-2"))
+	})
+
+	It("answers empty for non-replicated creates (queue, MVs)", func() {
+		path, replica := ddlReplicaIdentity("CREATE TABLE s (x String) ENGINE = S3Queue('https://bucket/p', 'NDJSON', 'auto')", "writer-0")
+		Expect(path).To(BeEmpty())
+		Expect(replica).To(BeEmpty())
+	})
+})
