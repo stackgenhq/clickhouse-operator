@@ -177,6 +177,13 @@ func (c *DynamoDBClaimer) Renew(ctx context.Context, req chinitport.RenewRequest
 			":me":    &dynamodbtypes.AttributeValueMemberS{Value: req.InstanceID},
 		},
 	})
+	if isConditionalCheckFailed(err) {
+		// The stolen-ordinal signal: the row's owner is no longer this
+		// instance. Map onto the port sentinel so the identity settle
+		// can separate it from the transient API failures the retry
+		// policy owns (the refresh path's Fatal-vs-retryable split).
+		return fmt.Errorf("%w: renew %s as %s in table %s", chinitport.ErrLeaseStolen, req.Hostname, req.InstanceID, req.Table)
+	}
 	return err
 }
 

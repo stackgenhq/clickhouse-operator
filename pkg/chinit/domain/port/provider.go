@@ -27,6 +27,7 @@ package port
 
 import (
 	"context"
+	"errors"
 
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
@@ -117,6 +118,18 @@ type ReleaseRequest struct {
 	// an ownership concept may ignore it.
 	InstanceID string
 }
+
+// ErrLeaseStolen is the sentinel for a FAILED-OWNERSHIP renewal: the
+// lease's conditional update rejected this instance because another
+// instance holds the ordinal now. Every OrdinalClaimer maps its
+// native conditional failure (DynamoDB ConditionalCheckFailed, Table
+// Storage's etag precondition) onto it. The boot's identity settle
+// treats it as Fatal — the node must not serve under a name someone
+// else owns — while TRANSIENT renewal errors (throttling, network)
+// stay plain errors the retry policy owns. Without the sentinel, the
+// two classes shared one Fatal classification and one API blip
+// aborted healthy in-place refreshes.
+var ErrLeaseStolen = errors.New("lease stolen: another instance holds this ordinal")
 
 // DNSRegistrar manages the node's private-zone A record. Readers
 // self-register at claim time and the spot drain deregisters; writers

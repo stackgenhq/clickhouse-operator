@@ -236,6 +236,31 @@ var _ = Describe("DiskManager.MountAll", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(fail.IsFatal(err)).To(BeTrue())
 	})
+
+	It("answers retryable (not Fatal) when the metadata volume is not yet attached", func() {
+		// The EBS-attach race: a first-boot pass can run before the
+		// volume surfaces — the boot step's bootWait policy owns the
+		// wait, so a plain error is the contract. Fatal here aborted
+		// healthy instances 35s into boot while the ASG instance
+		// refresh wedged at 50% (the live 2026-11-15 finding).
+		r := newFakeRunner().
+			// Every metadata probe answers empty: no labeled device
+			// (blkid -l prints nothing), and NONE of the AWS fallback
+			// candidates exists as a block device (each test -b fails).
+			script("blkid -l -o device -t LABEL=ch-metadata", "").
+			fail("test -b /dev/sdf").
+			fail("test -b /dev/sdb").
+			fail("test -b /dev/nvme1n1").
+			fail("test -b /dev/xvdf").
+			fail("test -b /dev/xvdb")
+		d := NewDiskManager(r)
+
+		_, err := d.MountAll(context.Background(), specFor(model.RoleWriter), nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("EBS volume not attached yet"))
+		Expect(fail.IsFatal(err)).To(BeFalse(),
+			"a transient attach race must stay retryable: Fatal would defeat the boot step's bootWait policy")
+	})
 })
 
 var _ = Describe("ValidateXML", func() {

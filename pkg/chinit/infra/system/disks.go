@@ -217,6 +217,18 @@ func (d *DiskManager) candidatesFor(platform string) (meta, cache, keeper string
 // (keeper runs on default storage when the dedicated disk is missing,
 // with an IOPS-contention warning). The caller (boot step) supplies the
 // retry policy; this function is one convergent pass.
+//
+// A metadata disk that is not YET VISIBLE returns a plain (retryable)
+// error — never Fatal. EBS volumes attach asynchronously and the first
+// boot pass can legitimately run before the attachment surfaces; the
+// boot step's bootWait policy (30 attempts, ~1 min) is the wait that
+// closes the race. Fatal here would misclassify a transient attach as
+// permanent and abort the boot on a healthy instance (the live
+// 2026-11-15 finding: the r8g writer scale-out aborted at mount_data_disks
+// 35s into boot while its 64 GB metadata volume was still attaching —
+// the ASG instance refresh wedged at 50% and the fleet sat at half
+// capacity). Fatal stays reserved for the cases a retry cannot cure:
+// the metadata-disk MOUNT itself failing (corrupt fs, device error).
 func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnameSet func()) ([]MountedDisk, error) {
 	metaCands, cacheCands, keeperCands := d.candidatesFor(d.Platform)
 
@@ -228,7 +240,7 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 		return mounted, err
 	}
 	if dev == "" {
-		return mounted, chinitsvc.Fatal(fmt.Errorf("metadata disk not found (label=%s): EBS volume not attached yet", spec.Disks.MetadataLabel))
+		return mounted, fmt.Errorf("metadata disk not found (label=%s): EBS volume not attached yet", spec.Disks.MetadataLabel)
 	}
 	md, err := d.MountDisk(ctx, spec.Disks.MetadataLabel, "/var/lib/clickhouse", dev)
 	if err != nil {

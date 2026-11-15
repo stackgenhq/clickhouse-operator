@@ -142,15 +142,32 @@ var _ = Describe("restoreIdentity (refresh path)", func() {
 		Expect(*persisted).To(BeNumerically(">=", 1))
 	})
 
-	It("fails closed when the lease renew is rejected (lost the lease)", func() {
+	It("fails closed when the renew reports a stolen lease (the port sentinel)", func() {
 		dir := GinkgoT().TempDir()
-		claimer := &refreshClaimer{renewErr: errors.New("conditional check failed: instance_id mismatch")}
+		claimer := &refreshClaimer{renewErr: fmt.Errorf("%w: renew reader-1 as i-self", port.ErrLeaseStolen)}
 		b, _ := newBoot(dir, claimer)
 
 		err := b.settleIdentity(context.Background())
 		Expect(err).To(HaveOccurred())
-		Expect(fail.IsFatal(err)).To(BeTrue(), "a lost lease is fatal: the node must not serve under a recycled name")
+		Expect(fail.IsFatal(err)).To(BeTrue(), "a stolen lease is fatal: the node must not serve under a recycled name")
 		Expect(err.Error()).To(ContainSubstring("reader-1"))
+		Expect(err.Error()).To(ContainSubstring("re-image"))
+	})
+
+	It("answers retryable (not Fatal) when the renew fails transiently", func() {
+		dir := GinkgoT().TempDir()
+		// A throttling-class blip carries NO stolen-lease sentinel —
+		// the claim policy owns the retry; only an exhausted sweep
+		// fails the refresh (the same Fatal-vs-retryable split the
+		// disk-attach race needed).
+		claimer := &refreshClaimer{renewErr: errors.New("provisioned throughput exceeded for table")}
+		b, _ := newBoot(dir, claimer)
+
+		err := b.settleIdentity(context.Background())
+		Expect(err).To(HaveOccurred())
+		Expect(fail.IsFatal(err)).To(BeFalse(),
+			"a transient API blip must stay retryable: Fatal would abort a healthy refresh on one throttled call")
+		Expect(err.Error()).To(ContainSubstring("lease renew"))
 	})
 
 	It("refuses to refresh when the state file belongs to a different instance", func() {

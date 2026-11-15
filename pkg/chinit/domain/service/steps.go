@@ -16,6 +16,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -326,15 +327,24 @@ func (b *Boot) restoreIdentity(ctx context.Context) error {
 		}
 		// Renew proves ownership without moving the ordinal: the renew
 		// condition pins instance_id, so a renewal succeeds iff WE hold the
-		// lease. A lost lease (expired and re-taken) fails loudly here
-		// instead of silently serving under a recycled name.
+		// lease. The STOLEN-LEASE failure (the port's ErrLeaseStolen —
+		// the provider's conditional-check rejection) is Fatal: do NOT
+		// keep serving under a recycled name. A TRANSIENT failure
+		// (throttling, network, DynamoDB blip) is a plain error the
+		// claimSweep policy retries — only an exhausted sweep fails the
+		// refresh. Classifying the transient class Fatal aborted healthy
+		// in-place refreshes on one API blip (the same misclassification
+		// the disk-attach race carried).
 		if err := claimer.RenewLease(ctx, port.RenewRequest{
 			Table:        id.LeaseTable,
 			Hostname:     id.Hostname,
 			InstanceID:   b.Meta.InstanceID,
 			LeaseSeconds: 900,
 		}); err != nil {
-			return Fatal(fmt.Errorf("lease renew for %s failed (%v) — another instance may hold it now; do NOT keep serving under this name; re-image the node", id.Hostname, err))
+			if errors.Is(err, port.ErrLeaseStolen) {
+				return Fatal(fmt.Errorf("lease renew for %s failed (%v) — another instance holds it now; do NOT keep serving under this name; re-image the node", id.Hostname, err))
+			}
+			return fmt.Errorf("lease renew for %s failed: %w", id.Hostname, err)
 		}
 		slog.Info("identity: persisted lease renewed", "hostname", id.Hostname, "lease_table", id.LeaseTable)
 	default:

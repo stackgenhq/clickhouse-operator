@@ -311,7 +311,9 @@ func (c *TableClaimer) Renew(ctx context.Context, req chinitport.RenewRequest) e
 		return err
 	}
 	if entity.InstanceID != req.InstanceID {
-		return fmt.Errorf("lease %q is held by instance %q, not %q — refusing to renew a stolen ordinal", req.Hostname, entity.InstanceID, req.InstanceID)
+		// The stolen-ordinal signal: map onto the port sentinel so the
+		// identity settle separates it from transient API failures.
+		return fmt.Errorf("%w: renew %s as %s", chinitport.ErrLeaseStolen, req.Hostname, req.InstanceID)
 	}
 	entity.LeaseUntil = time.Now().Unix() + int64(req.LeaseSeconds)
 	patch, err := json.Marshal(entity)
@@ -331,6 +333,14 @@ func (c *TableClaimer) Renew(ctx context.Context, req chinitport.RenewRequest) e
 	}
 	defer func() { _ = mresp.Body.Close() }()
 	if mresp.StatusCode != http.StatusNoContent {
+		// 412 Precondition Failed: the etag raced — a concurrent
+		// writer replaced the entity between the read and the patch.
+		// That is the stolen-ordinal signal on Azure (the row may
+		// carry a different owner now), mapped onto the port sentinel
+		// exactly like the explicit owner check above.
+		if mresp.StatusCode == http.StatusPreconditionFailed {
+			return fmt.Errorf("%w: renew %s as %s (etag race)", chinitport.ErrLeaseStolen, req.Hostname, req.InstanceID)
+		}
 		return fmt.Errorf("renew %q: status %d", req.Hostname, mresp.StatusCode)
 	}
 	return nil
