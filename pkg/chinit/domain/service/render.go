@@ -538,6 +538,7 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	// functions, codecs, tuples — never terminate a statement).
 	statements := splitSQLStatements(string(data))
 	created := 0
+	failed := 0
 	for _, stmt := range statements {
 		s := strings.TrimSpace(stmt)
 		if s == "" || !strings.Contains(s, "CREATE") {
@@ -559,32 +560,45 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 			// registration (parts/queue znodes included — safe on a
 			// fresh disk whose parts do not exist), and the retried
 			// CREATE registers clean.
-			if strings.Contains(out, "253") || strings.Contains(err.Error(), "253") {
+			if strings.Contains(out, "Code: 253") || strings.Contains(err.Error(), "Code: 253") {
 				if tablePath, replicaName := ddlReplicaIdentity(s, b.Identity.Hostname); tablePath != "" {
 					dropSQL := fmt.Sprintf("SYSTEM DROP REPLICA '%s' FROM ZKPATH '%s'", replicaName, tablePath)
 					if dOut, dErr := execClient(ctx, adminPw, dropSQL); dErr != nil {
 						fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL stale-replica drop failed for %s: %v: %s\n", tablePath, dErr, strings.TrimSpace(dOut))
+						failed++
 					} else if rOut, rErr := execClient(ctx, adminPw, s); rErr != nil {
 						fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed after drop (continuing): %v: %s\n", rErr, strings.TrimSpace(rOut))
-						continue
+						failed++
 					} else {
 						created++
 						fmt.Printf("schema bootstrap: %s re-created after dropping stale znode\n", tablePath)
-						continue
 					}
+					continue
 				}
 			}
-			// Other failures (a table the node already carries via
-			// normal replication — TABLE_EXISTS — or transient errors)
-			// log and continue: the statement set is independent per
-			// object, and the schema-sync unit and health gate remain
-			// the heal paths.
+			// Other failures log and continue — but they COUNT: the
+			// step returns an error when any statement failed so the
+			// step-level apiRetry re-runs the whole idempotent pass
+			// (the live 2026-11-15 keeper race: the CREATEs failed
+			// Code 999 — ZooKeeper connection refused while the
+			// keeper rolled in the same refresh — and the step
+			// "succeeded" on the one statement that did not need
+			// keeper, never retrying against the recovered keeper).
+			failed++
 			fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed (continuing): %v: %s\n", err, strings.TrimSpace(out))
 			continue
 		}
 		created++
 	}
-	fmt.Printf("schema bootstrap: %d statement(s) applied from %s\n", created, ddlPath)
+	fmt.Printf("schema bootstrap: %d statement(s) applied from %s (%d failed)\n", created, ddlPath, failed)
+	// A retryable error surfaces when anything failed: the statement set
+	// is idempotent (IF NOT EXISTS + the drop-own-znode conflict path),
+	// so a re-run converges instead of wedging. BestEffort classification
+	// still keeps a final-pass failure from killing the boot — the
+	// schema-sync unit and health gate remain the heal paths.
+	if failed > 0 {
+		return fmt.Errorf("schema bootstrap: %d statement(s) failed (retrying; transient keeper races converge on the next pass)", failed)
+	}
 	return nil
 }
 
