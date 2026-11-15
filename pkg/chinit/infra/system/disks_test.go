@@ -96,6 +96,48 @@ func specFor(role model.Role) model.BootSpec {
 	}
 }
 
+var _ = Describe("DiskManager.ResolveDevice partition-table guard", func() {
+	// The 2026-11-15 t4g.xlarge finding: the ROOT disk enumerated as
+	// nvme1n1 (Graviton NVMe order is not stable across instance
+	// types), the metadata candidate list adopted it, and e2label
+	// would have run against the root filesystem — only the GPT
+	// signature refusal inside e2label saved the boot. Candidates
+	// carrying a partition table (blkid TYPE=dos/gpt) must be SKIPPED,
+	// never adopted.
+	It("skips a candidate that carries a partition table and takes the next blank device", func() {
+		r := newFakeRunner()
+		// No label on any device (first boot).
+		r.script("blkid -L ch-metadata", "")
+		// nvme1n1 exists as a block device but reports a GPT table
+		// (the root disk's signature).
+		r.script("test -b /dev/nvme1n1", "")
+		r.script("blkid /dev/nvme1n1", `UUID="..." TYPE="gpt"`)
+		// nvme2n1 exists and is blank.
+		r.script("test -b /dev/nvme2n1", "")
+		r.script("blkid /dev/nvme2n1", "")
+
+		dm := NewDiskManager(r)
+		dev, err := dm.ResolveDevice(context.Background(), "ch-metadata", "/dev/nvme1n1 /dev/nvme2n1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dev).To(Equal("/dev/nvme2n1"),
+			"a partition-table candidate must never be adopted")
+		Expect(r.invoked("e2label /dev/nvme1n1 ch-metadata")).To(BeFalse(),
+			"e2label must never run against the partitioned candidate")
+	})
+
+	It("formats the first blank candidate when no partition-table device intervenes", func() {
+		r := newFakeRunner()
+		r.script("blkid -L ch-metadata", "")
+		r.script("test -b /dev/nvme1n1", "")
+		r.script("blkid /dev/nvme1n1", "")
+
+		dm := NewDiskManager(r)
+		dev, err := dm.ResolveDevice(context.Background(), "ch-metadata", "/dev/nvme1n1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dev).To(Equal("/dev/nvme1n1"))
+	})
+})
+
 var _ = Describe("DiskManager.MountDisk", func() {
 	It("formats a blank device with the label on first boot, then mounts it", func() {
 		// no label yet; blank disk: no signature; not mounted yet

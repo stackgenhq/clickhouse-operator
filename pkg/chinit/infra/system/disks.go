@@ -86,11 +86,36 @@ func (d *DiskManager) ResolveByLabel(ctx context.Context, label string) (string,
 // simply doesn't match.
 func (d *DiskManager) resolveFirstExisting(ctx context.Context, candidates string) (string, error) {
 	for _, dev := range strings.Fields(candidates) {
-		if _, err := d.runner.Run(ctx, "test", "-b", dev); err == nil {
-			return dev, nil
+		if _, err := d.runner.Run(ctx, "test", "-b", dev); err != nil {
+			continue
 		}
+		// Never adopt a disk that carries a PARTITION TABLE: on
+		// Graviton the NVMe enumeration order is not stable (the
+		// 2026-11-15 t4g.xlarge finding: the ROOT disk enumerated as
+		// nvme1n1 and the metadata candidate list adopted it —
+		// e2label would have run against the root filesystem; only
+		// the GPT-signature refusal in e2label saved the boot from
+		// corrupting /). A partition table (blkid TYPE=dos/gpt) means
+		// the disk belongs to the OS or a prior tenant — data disks
+		// for this stack are whole-device filesystems, never
+		// partitioned.
+		if d.carriesPartitionTable(ctx, dev) {
+			continue
+		}
+		return dev, nil
 	}
 	return "", nil
+}
+
+// carriesPartitionTable reports whether the device's first signature is
+// a partition table (dos/gpt) rather than a filesystem — the shape that
+// marks root/OS disks and must never be relabeled or formatted.
+func (d *DiskManager) carriesPartitionTable(ctx context.Context, device string) bool {
+	out, err := d.runner.Run(ctx, "blkid", device)
+	if err != nil {
+		return false // blank device: safe to format (the first-boot case)
+	}
+	return strings.Contains(out, `TYPE="dos"`) || strings.Contains(out, `TYPE="gpt"`)
 }
 
 // ResolveDevice resolves a disk: label first (repeat boots), then the
