@@ -28,8 +28,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Provider is the Azure registry entry.
@@ -43,16 +43,20 @@ type Provider struct {
 	bundle          *BlobBundleSource
 	bundleOverride  port.ConfigSource
 	claims          *TableClaimer
+	lister          *TableClaimLister
 	dns             *PrivateDNS
-	spot    *ScheduledEventsWatcher
+	volumes         *VolumeGrower
+	spot            *ScheduledEventsWatcher
 }
 
 // Compile-time capability checks.
 var (
 	_ port.Provider       = (*Provider)(nil)
 	_ port.OrdinalClaimer = (*Provider)(nil)
+	_ port.LeaseLister    = (*Provider)(nil)
 	_ port.DNSRegistrar   = (*Provider)(nil)
-	_ port.SpotSignals     = (*Provider)(nil)
+	_ port.SpotSignals    = (*Provider)(nil)
+	_ port.VolumeGrower   = (*Provider)(nil)
 )
 
 // New builds the Azure provider.
@@ -66,7 +70,9 @@ func New(cfg port.Config) port.Provider {
 	p.secrets = NewKeyVaultSource(cfg.Spec)
 	p.bundle = NewBlobBundleSource(cfg.Spec)
 	p.claims = NewTableClaimer(cfg.Spec)
+	p.lister = NewTableClaimLister(p.claims)
 	p.dns = NewPrivateDNS(cfg.Spec)
+	p.volumes = NewVolumeGrower()
 	p.spot = NewScheduledEventsWatcher()
 	return p
 }
@@ -129,6 +135,28 @@ func (p *Provider) RenewLease(ctx context.Context, req port.RenewRequest) error 
 // ReleaseLease drops the node's claim.
 func (p *Provider) ReleaseLease(ctx context.Context, req port.ReleaseRequest) error {
 	return p.claims.Release(ctx, req)
+}
+
+// ListActiveClaims enumerates the cluster's live ordinal leases (the
+// inventory source for remote_servers and the -host flags) over the
+// same Table Storage the claimer writes.
+func (p *Provider) ListActiveClaims(ctx context.Context, req port.ListClaimsRequest) ([]port.Claim, error) {
+	return p.lister.ListActiveClaims(ctx, req)
+}
+
+// DescribeOwnVolume returns the data disk attached to this VM.
+func (p *Provider) DescribeOwnVolume(ctx context.Context, req port.VolumeGrowRequest) (*port.VolumeInfo, error) {
+	return p.volumes.DescribeOwnVolume(ctx, req)
+}
+
+// GrowVolume extends this VM's managed disk online (no-op at target).
+func (p *Provider) GrowVolume(ctx context.Context, volumeID string, targetSizeGB int32) (bool, error) {
+	return p.volumes.GrowVolume(ctx, volumeID, targetSizeGB)
+}
+
+// WaitForModification blocks until the disk resize converges.
+func (p *Provider) WaitForModification(ctx context.Context, volumeID string) error {
+	return p.volumes.WaitForModification(ctx, volumeID)
 }
 
 // ResolveZoneID finds the private DNS zone by name (ARM query).

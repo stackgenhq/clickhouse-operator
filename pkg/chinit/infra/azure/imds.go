@@ -23,14 +23,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Azure IMDS: one endpoint, the Metadata: true header, JSON documents.
 const (
-	azureIMDSURL        = "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
-	azureIMDSTimeout    = 3 * time.Second
+	azureIMDSURL     = "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+	azureIMDSTimeout = 3 * time.Second
 )
 
 // IMDSMetadata reads Azure instance metadata.
@@ -56,11 +56,11 @@ func (m *IMDSMetadata) WithClient(c httpClient) *IMDSMetadata {
 // instanceDoc is the subset of the IMDS instance document the boot needs.
 type instanceDoc struct {
 	Compute struct {
-		Name       string `json:"name"`
-		VMID       string `json:"vmId"`
-		Zone       string `json:"zone"`
-		Location   string `json:"location"`
-		PrivateIP  string `json:"privateIpAddress"`
+		Name      string `json:"name"`
+		VMID      string `json:"vmId"`
+		Zone      string `json:"zone"`
+		Location  string `json:"location"`
+		PrivateIP string `json:"privateIpAddress"`
 	} `json:"compute"`
 	Network struct {
 		Interfaces []struct {

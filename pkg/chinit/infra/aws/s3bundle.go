@@ -59,6 +59,11 @@ var bundleFiles = []bundleFile{
 	{key: "configs/ssl.xml", name: "ssl.xml", hashed: true},
 	{key: "configs/storage.xml", name: "storage.xml", hashed: true},
 	{key: "configs/backup-replica-settings.xml", name: "backup-replica-settings.xml", hashed: true},
+	// The bootstrap DDL (the 2026-11-15 full-churn finding: the schema
+	// must ship WITH the bundle — schema-sync cannot propagate from
+	// peers when every peer churns at once). Hashed: a DDL change rolls
+	// the fleet like any config change (the bundle hash gates it).
+	{key: "configs/bootstrap-ddl.sql", name: "bootstrap-ddl.sql", hashed: true},
 	{key: "chi.yaml", name: "chi.yaml", hashed: true},
 	{key: "keeper.yaml", name: "keeper.yaml", hashed: false},
 }

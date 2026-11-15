@@ -487,10 +487,81 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 	return nil
 }
 
+// bootstrapSchema executes the bundle's bootstrap-ddl.sql idempotently
+// on server nodes — the durable home for the fleet's schema (the
+// 2026-11-15 full-churn finding: when every peer churns within one
+// refresh, schema-sync has no peer to propagate from and the fleet
+// stays schemaless until a manual DDL session recovers it from keeper
+// metadata; the DDL now ships with the config bundle so every node
+// re-materializes its own tables at boot).
+//
+// The DDL's {shard}/{replica} are CLICKHOUSE macros — the server
+// substitutes them from chop-generated-macros.xml at statement time,
+// so this function passes the file through UNCHANGED. Every statement
+// is IF NOT EXISTS: a node that already holds the schema no-ops.
+//
+// BestEffort by design: a fleet with pre-existing znode drift (replica
+// name conflicts from prior generations) fails a CREATE with
+// REPLICA_ALREADY_EXISTS — that must not wedge the boot (the schema-sync
+// unit and the health gate remain the heal paths); the failure is loud
+// in the boot log for triage.
+func (b *Boot) bootstrapSchema(ctx context.Context) error {
+	if b.Spec.Role == model.RoleKeeper {
+		return nil // keepers carry no tables
+	}
+	ddlPath := filepath.Join(BootstrapDir, "bootstrap-ddl.sql")
+	data, err := os.ReadFile(ddlPath)
+	if err != nil {
+		// A bundle without the DDL is the pre-0.2.14 image shape —
+		// loud no-op, never fatal (the schema-sync path remains).
+		fmt.Fprintf(os.Stderr, "WARNING: bootstrap-ddl.sql not in the bundle (older AMI?) — schema bootstrap skipped: %v\n", err)
+		return nil
+	}
+	pw, err := os.ReadFile(BootstrapDir + "/admin-password")
+	if err != nil {
+		return fmt.Errorf("read admin password file: %w", err)
+	}
+	adminPw := strings.TrimSpace(string(pw))
+
+	// Statement-split: the DDL is one statement per terminator; empty
+	// segments (comments' trailing semicolons, blank lines) skip.
+	created := 0
+	for _, stmt := range strings.Split(string(data), ";") {
+		s := strings.TrimSpace(stmt)
+		if s == "" || !strings.Contains(s, "CREATE") {
+			continue
+		}
+		out, err := execClient(ctx, adminPw, s)
+		if err != nil {
+			// Existing-object conflicts are the expected convergence
+			// case (REPLICA_ALREADY_EXISTS / a table the node already
+			// carries): log and continue — the statement set is
+			// independent per object.
+			fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed (continuing): %v: %s\n", err, strings.TrimSpace(out))
+			continue
+		}
+		created++
+	}
+	fmt.Printf("schema bootstrap: %d statement(s) applied from %s\n", created, ddlPath)
+	return nil
+}
+
+// execClient runs one SQL statement as admin over the local client (the
+// same credential shape the drain/disk-autoscale probes use — env, never
+// argv).
+func execClient(ctx context.Context, adminPw, query string) (string, error) {
+	cmd := exec.CommandContext(ctx, "clickhouse-client", "--user", "admin", "--password", adminPw, "--query", query)
+	cmd.Env = append(os.Environ(), "CLICKHOUSE_USER=admin", "CLICKHOUSE_PASSWORD="+adminPw)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("clickhouse-client: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
 // healthGate runs the cluster health check as a library call — the
 // operator's health service over the chctl probe (the same code path
-// `chctl health` exercised; the binary is gone, the library remains).
-// Non-Fatal BY DESIGN (the step's Criticality is BestEffort): a reader
+// `chctl health` exercised; the binary is gone, the library remains).// Non-Fatal BY DESIGN (the step's Criticality is BestEffort): a reader
 // booting while a peer is down must still join; the WARNING + report
 // make a degraded boot loud in the logs.
 //

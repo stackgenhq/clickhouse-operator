@@ -37,6 +37,14 @@ var (
 	apiRetry = Policy{Attempts: 5, BaseDelay: 2 * time.Second, MaxDelay: 10 * time.Second}
 	// bootWait: waiting on the system (services, disks) — patient.
 	bootWait = Policy{Attempts: 30, BaseDelay: 2 * time.Second, MaxDelay: 10 * time.Second}
+	// ebsAttachWait: the async EBS-attach window on scale-out launches
+	// (the 2026-11-15 r8g finding: a 64 GiB metadata volume surfaced
+	// AFTER bootWait's ~60s window on a fresh r8g.2xlarge; the boot
+	// aborted, cloud-init recorded error, and the node sat half-booted
+	// until a manual re-run). Large-volume attach on instance launch
+	// can take minutes — 5 minutes of patient retry keeps the boot
+	// alive without wedging the ASG (instance-refresh warmup is 300s).
+	ebsAttachWait = Policy{Attempts: 60, BaseDelay: 3 * time.Second, MaxDelay: 10 * time.Second, Deadline: 5 * time.Minute}
 	// onceFatal: config-class operations where a retry masks a bug
 	// (SHA mismatch, malformed XML): one attempt, no retry.
 	onceFatal = Policy{Attempts: 1}
@@ -89,9 +97,12 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 			}),
 
 			// 4. Mount data disks (metadata Critical; cache/keeper degrade
-			// inside). EBS volumes attach asynchronously — bootWait covers
-			// the attach window.
-			StepFunc("mount_data_disks", Critical, bootWait, func(ctx context.Context) error {
+			// inside). EBS volumes attach asynchronously — ebsAttachWait
+			// covers the attach window (the 5-minute patient window: the
+			// 2026-11-15 r8g scale-out wedged at bootWait's ~60s because
+			// the metadata volume attached at minute 2; a manual re-run
+			// was the only recovery).
+			StepFunc("mount_data_disks", Critical, ebsAttachWait, func(ctx context.Context) error {
 				_, err := disks.MountAll(ctx, *b.Spec, nil)
 				return err
 			}),
@@ -163,6 +174,18 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 
 		// 11. Start clickhouse-server (CRITICAL; keepers skip inside).
 		StepFunc("start_clickhouse", Critical, onceFatal, b.startClickhouse),
+
+		// 11b. Bootstrap schema (server nodes): execute the bundle's
+		// bootstrap-ddl.sql idempotently — the 2026-11-15 full-churn
+		// finding: when every peer churns within one refresh, no node
+		// holds the schema for schema-sync to propagate from, and the
+		// fleet stays schemaless until a manual DDL session recovers it
+		// from keeper metadata. The DDL ships WITH the config bundle
+		// (Terraform uploads it next to the XMLs); every CREATE is IF
+		// NOT EXISTS with {shard}/{replica} macros, so a node that
+		// already has its tables is a no-op and a fully-churned fleet
+		// re-materializes its own schema at boot.
+		StepFunc("bootstrap_schema", BestEffort, apiRetry, b.bootstrapSchema),
 
 		// 12. Health gate: NON-FATAL by design — a reader booting while
 		// a peer is down (fleet rolling, spot churn) must still join; a
@@ -694,25 +717,40 @@ func mustRead(path string) []byte {
 // configureServerEnv writes the server's EnvironmentFile (the
 // /etc/default/clickhouse-server shape the bash era wrote) and the
 // systemd drop-in that loads it. storage.xml's <endpoint
-// from_env="CH_S3_ENDPOINT"> is a START requirement: unset, the server
-// dies with Code 36 Empty protocol in the URL (the live chinit-cutover
-// finding — the bash configure_environment_variables step had no
-// chinit equivalent). Credentials NEVER go here: the SDK chain reads
-// the instance role.
+// from_env="CH_S3_ENDPOINT"> is a START requirement on AWS: unset, the
+// server dies with Code 36 Empty protocol in the URL (the live
+// chinit-cutover finding — the bash configure_environment_variables
+// step had no chinit equivalent). On Azure the storage disk is
+// azure_blob_storage with the account name/key INLINE — no endpoint
+// env exists to write, so an empty s3_data_bucket is correct there,
+// not a spec error; writing the S3 line anyway would hand the server
+// a garbage URL (https://.s3...). Credentials NEVER go here: the SDK
+// chain reads the instance role.
 func (b *Boot) configureServerEnv(ctx context.Context) error {
-	if b.Spec.S3DataBucket == "" {
+	// The S3 endpoint env is an AWS-only requirement: the gate Fatals
+	// there (an empty bucket boots a server that dies at start), while
+	// Azure's blob disk needs no endpoint and skips the write.
+	if b.Spec.S3DataBucket == "" && b.Provider.Name() == "aws" {
 		return Fatal(fmt.Errorf("spec s3_data_bucket is empty — storage.xml's endpoint env cannot be set (Code 36 at server start)"))
 	}
 	region := b.Spec.Region
 	if region == "" {
 		region = b.Meta.Region
 	}
-	envFile := "/etc/default/clickhouse-server"
 	var sb strings.Builder
 	if b.Spec.Timezone != "" {
 		sb.WriteString("CLICKHOUSE_TZ=" + b.Spec.Timezone + "\n")
 	}
-	sb.WriteString("CH_S3_ENDPOINT=\"https://" + b.Spec.S3DataBucket + ".s3." + region + ".amazonaws.com\"\n")
+	if b.Spec.S3DataBucket != "" {
+		sb.WriteString("CH_S3_ENDPOINT=\"https://" + b.Spec.S3DataBucket + ".s3." + region + ".amazonaws.com\"\n")
+	}
+	// Nothing to pin (Azure with no timezone): skip the file write AND
+	// the drop-in — an EnvironmentFile pointing at nothing is noise,
+	// and the step must not touch /etc on a node with no env contract.
+	if sb.Len() == 0 {
+		return nil
+	}
+	envFile := "/etc/default/clickhouse-server"
 	if err := os.WriteFile(envFile, []byte(sb.String()), 0644); err != nil {
 		return Fatal(fmt.Errorf("write %s: %w", envFile, err))
 	}

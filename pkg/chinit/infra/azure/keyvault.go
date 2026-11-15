@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,8 +27,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
 
 // KeyVaultSource resolves Key Vault secrets over the managed-identity
@@ -151,8 +152,8 @@ type BlobBundleSource struct {
 // NewBlobBundleSource builds the fetcher.
 func NewBlobBundleSource(spec *model.BootSpec) *BlobBundleSource {
 	return &BlobBundleSource{
-		client:      http.DefaultClient,
-		spec:         spec,
+		client: http.DefaultClient,
+		spec:   spec,
 		TokenSource: func(ctx context.Context, resource string) (string, error) {
 			return managedIdentityToken(ctx, http.DefaultClient, resource)
 		},
@@ -162,6 +163,12 @@ func NewBlobBundleSource(spec *model.BootSpec) *BlobBundleSource {
 // FetchBundle downloads every bundle member. Blob download URLs need a
 // SAS token or a bearer; the managed identity token covers the bearer
 // path for the storage account the identity can read.
+//
+// The SHA256 gate contract mirrors the AWS fetcher exactly:
+// sha256(jsonencode(merge(config_files_all, {"chi.yaml": spec}))) —
+// jsonencode of a map renders SORTED key→content pairs, so the digest
+// recomputes Terraform's config_files_hash over the fetched members
+// (Go's json.Marshal of the same map is byte-identical).
 func (b *BlobBundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBundle, destDir string) ([]string, error) {
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return nil, chinitsvc.Fatal(fmt.Errorf("create %s: %w", destDir, err))
@@ -172,10 +179,10 @@ func (b *BlobBundleSource) FetchBundle(ctx context.Context, bundle model.ConfigB
 	}
 
 	var written []string
-	hasher := sha256.New()
-	for _, name := range bundleFiles {
+	hashedContents := map[string]string{}
+	for _, bf := range bundleFiles {
 		url := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s",
-			bundle.Bucket, strings.TrimPrefix(bundle.Prefix, "/"), name)
+			bundle.Bucket, strings.TrimPrefix(bundle.Prefix, "/"), bf.key)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, err
@@ -187,8 +194,11 @@ func (b *BlobBundleSource) FetchBundle(ctx context.Context, bundle model.ConfigB
 		}
 		body, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound && (name == "chi.yaml" || name == "keeper.yaml") {
-			continue // single-role stacks omit the other spec
+		// Blob-not-found for chi.yaml/keeper.yaml on single-role stacks
+		// is benign (the AWS NoSuchKey parity); missing static XMLs
+		// are fatal.
+		if resp.StatusCode == http.StatusNotFound && (bf.name == "chi.yaml" || bf.name == "keeper.yaml") {
+			continue
 		}
 		if readErr != nil {
 			return nil, readErr
@@ -199,16 +209,22 @@ func (b *BlobBundleSource) FetchBundle(ctx context.Context, bundle model.ConfigB
 		if len(body) == 0 {
 			return nil, fmt.Errorf("%s is empty", url)
 		}
-		dest := filepath.Join(destDir, name)
+		dest := filepath.Join(destDir, bf.name)
 		if err := os.WriteFile(dest, body, 0644); err != nil {
 			return nil, chinitsvc.Fatal(fmt.Errorf("write %s: %w", dest, err))
 		}
 		written = append(written, dest)
-		_, _ = hasher.Write(body)
+		if bf.hashed {
+			hashedContents[bf.key] = string(body)
+		}
 	}
 
 	if bundle.SHA256 != "" {
-		got := hex.EncodeToString(hasher.Sum(nil))
+		enc, err := json.Marshal(hashedContents)
+		if err != nil {
+			return written, fmt.Errorf("digest: %w", err)
+		}
+		got := hex.EncodeToString(sha256.New().Sum(enc))
 		if got != bundle.SHA256 {
 			return written, chinitsvc.Fatal(fmt.Errorf(
 				"config bundle SHA256 mismatch: want %s got %s — refusing to install", bundle.SHA256, got))

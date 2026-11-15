@@ -202,6 +202,22 @@ func claimRoleOrdinal(hostname, writerPrefix, readerPrefix string) (model.Role, 
 	return "", -1, false
 }
 
+// claimOrdinalFromHostname extracts the trailing ordinal from a leased
+// hostname (writer-3 -> 3) without knowing the prefix — the lease-renew
+// self-heal re-claims the node's OWN ordinal and only needs the number.
+// -1 answers "no ordinal" (backup-0, keeper-N, malformed).
+func claimOrdinalFromHostname(hostname string) int {
+	i := strings.LastIndexAny(hostname, "-")
+	if i < 0 || i == len(hostname)-1 {
+		return -1
+	}
+	n, err := strconv.Atoi(hostname[i+1:])
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
 // claimCRSlot maps one live claim to its CR slot ordinal — THE slot
 // arithmetic hostInventory, claimsHostFlags and the drain's peer
 // selection all key on: writers occupy 01-<ordinal> bounded by the
@@ -572,8 +588,52 @@ func runLeaseRenew(args []string) error {
 		LeaseSeconds: 900,
 	})
 	if err != nil {
-		slog.Warn("lease-renew: renewal failed", "err", err)
-		return err
+		// SELF-HEAL (the 2026-11-15 replacement-race finding): a renew
+		// against a vanished/re-assigned claim row failed forever
+		// (ConditionalCheckFailedException every 5-min tick) while the
+		// node kept serving as writer-N — its identity went unclaimed,
+		// the hosts convergence lost the peer, and nothing recovered
+		// it short of a manual DynamoDB put. The renewer now falls
+		// back to RE-CLAIMING its own ordinal: the claim's conditional
+		// write either takes the now-free seat back (the common race
+		// outcome — the dying node's drain deleted the row after this
+		// node's boot claimed it) or answers taken (a replacement
+		// owns the name; the node needs a re-image anyway).
+		slog.Warn("lease-renew: renewal failed — re-claiming the ordinal",
+			"hostname", st.Identity.Hostname, "err", err)
+		ordinal := claimOrdinalFromHostname(st.Identity.Hostname)
+		if ordinal < 0 {
+			slog.Warn("lease-renew: hostname carries no ordinal — cannot re-claim", "hostname", st.Identity.Hostname)
+			return err
+		}
+		spec, serr := loadInventorySpec()
+		if serr != nil || spec == nil {
+			slog.Warn("lease-renew: spec unreadable — cannot re-claim", "err", serr)
+			return err
+		}
+		rctx, rcancel := context.WithTimeout(context.Background(), 16*time.Minute)
+		defer rcancel()
+		newOrdinal, cerr := claimer.ClaimOrdinal(rctx, port.ClaimRequest{
+			Table:           st.Identity.LeaseTable,
+			Prefix:          st.Identity.Hostname[:len(st.Identity.Hostname)-len(fmt.Sprintf("%d", ordinal))],
+			Count:           ordinal + 1,
+			InstanceID:      st.Identity.InstanceID,
+			PrivateIP:       st.Identity.PrivateIP,
+			LeaseSeconds:    900,
+			DeadlineSeconds: 900,
+		})
+		if cerr != nil {
+			slog.Warn("lease-renew: re-claim failed", "err", cerr)
+			return err
+		}
+		if newOrdinal != ordinal {
+			// A different ordinal was claimed: the identity CHANGED —
+			// this is the one outcome the timer cannot converge (the
+			// hostname, DNS, and keeper registrations all key on the
+			// name). Loud failure; the node needs a re-image.
+			return fail.Fatal(fmt.Errorf("lease-renew: re-claim took ordinal %d, identity is %s (node must re-image)", newOrdinal, st.Identity.Hostname))
+		}
+		slog.Info("lease-renew: ordinal re-claimed", "hostname", st.Identity.Hostname, "ordinal", ordinal)
 	}
 	slog.Info("lease-renew: lease extended", "hostname", st.Identity.Hostname)
 

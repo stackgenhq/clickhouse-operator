@@ -32,13 +32,32 @@ import (
 )
 
 // bundleFiles mirrors the AWS provider's closed bundle member list (the
-// Terraform bundle layout is identical across clouds).
-var bundleFiles = []string{
-	"network.xml",
-	"ssl.xml",
-	"storage.xml",
-	"chi.yaml",
-	"keeper.yaml",
+// Terraform bundle layout is identical across clouds): key is the blob
+// name under the bundle prefix (the same keys Terraform uploads), name
+// is the on-disk staging name, hashed gates the digest membership.
+// keeper.yaml is fetched when present but EXCLUDED from the digest
+// (Terraform's hash does not include it; including it would make the
+// digest role-dependent). backup-replica-settings.xml participates in
+// the digest AND is fetched by every role — the installer gates the
+// install to the backup role.
+var bundleFiles = []bundleFile{
+	{key: "configs/network.xml", name: "network.xml", hashed: true},
+	{key: "configs/ssl.xml", name: "ssl.xml", hashed: true},
+	{key: "configs/storage.xml", name: "storage.xml", hashed: true},
+	{key: "configs/backup-replica-settings.xml", name: "backup-replica-settings.xml", hashed: true},
+	// The bootstrap DDL (the 2026-11-15 full-churn finding — schema
+	// ships with the bundle). Hashed: a DDL change rolls the fleet
+	// like any config change.
+	{key: "configs/bootstrap-ddl.sql", name: "bootstrap-ddl.sql", hashed: true},
+	{key: "chi.yaml", name: "chi.yaml", hashed: true},
+	{key: "keeper.yaml", name: "keeper.yaml", hashed: false},
+}
+
+// bundleFile is one closed bundle member.
+type bundleFile struct {
+	key    string // blob name under the bundle prefix
+	name   string // on-disk name in the staging dir
+	hashed bool   // participates in the SHA256 gate digest
 }
 
 // jsonUnmarshal is json.Unmarshal (single import point for the small

@@ -24,8 +24,8 @@ import (
 	"os"
 	"strings"
 
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // PrivateDNS manages the node's A record in an Azure Private DNS zone
@@ -69,8 +69,8 @@ func (p *PrivateDNS) ResolveZoneID(ctx context.Context, zoneName string) (string
 // recordSetDoc is the PUT body for the A record set.
 type recordSetDoc struct {
 	Properties struct {
-		TTL             int    `json:"ttl"`
-		ARecords        []aRec `json:"aRecords"`
+		TTL      int    `json:"ttl"`
+		ARecords []aRec `json:"aRecords"`
 	} `json:"properties"`
 }
 

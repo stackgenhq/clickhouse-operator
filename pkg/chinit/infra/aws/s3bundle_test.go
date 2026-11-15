@@ -61,6 +61,7 @@ func bundleKeys() map[string]string {
 		"bootstrap/configs/ssl.xml":                     "<ssl/>",
 		"bootstrap/configs/storage.xml":                 "<storage/>",
 		"bootstrap/configs/backup-replica-settings.xml": "<backup-replica/>",
+		"bootstrap/configs/bootstrap-ddl.sql":           "-- ddl",
 		"bootstrap/chi.yaml":                            "chi: spec",
 	}
 }
@@ -80,8 +81,8 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 			// (the live chinit-v0.1.0 boot failed exactly this way).
 			written, err := fetch(bundleKeys(), model.ConfigBundle{Bucket: "data-bucket", Prefix: "bootstrap"})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(written).To(HaveLen(5))
-			for _, name := range []string{"network.xml", "ssl.xml", "storage.xml", "backup-replica-settings.xml", "chi.yaml"} {
+			Expect(written).To(HaveLen(6))
+			for _, name := range []string{"network.xml", "ssl.xml", "storage.xml", "backup-replica-settings.xml", "bootstrap-ddl.sql", "chi.yaml"} {
 				Expect(written).To(ContainElement(HaveSuffix("/" + name)))
 			}
 			// keeper.yaml NoSuchKey is benign (single-role stacks skip
@@ -121,6 +122,7 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 				"configs/ssl.xml":                     ssl,
 				"configs/storage.xml":                 stor,
 				"configs/backup-replica-settings.xml": "<backup-replica/>",
+				"configs/bootstrap-ddl.sql":           "-- ddl",
 				"chi.yaml":                            chi,
 			}
 			enc, err := json.Marshal(merge) // jsonencode: sorted pairs, escaped values
@@ -133,11 +135,12 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 				"bootstrap/configs/ssl.xml":                     ssl,
 				"bootstrap/configs/storage.xml":                 stor,
 				"bootstrap/configs/backup-replica-settings.xml": "<backup-replica/>",
+				"bootstrap/configs/bootstrap-ddl.sql":           "-- ddl",
 				"bootstrap/chi.yaml":                            chi,
 			}
 			written, err := fetch(keys, model.ConfigBundle{Bucket: "data-bucket", Prefix: "bootstrap", SHA256: wantHex})
 			Expect(err).NotTo(HaveOccurred(), "the gate MUST accept Terraform's own digest; got: %v", err)
-			Expect(written).To(HaveLen(5))
+			Expect(written).To(HaveLen(6))
 
 			// And a one-bit content change must be refused.
 			keys["bootstrap/configs/storage.xml"] = stor + "\n<!-- edited -->"
@@ -154,6 +157,7 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 				"configs/ssl.xml":                     "<ssl/>",
 				"configs/storage.xml":                 "<storage/>",
 				"configs/backup-replica-settings.xml": "<backup-replica/>",
+				"configs/bootstrap-ddl.sql":           "-- ddl",
 				"chi.yaml":                            "chi: spec",
 			}
 			enc, err := json.Marshal(merge)
