@@ -42,19 +42,31 @@ import (
 type recordedCommand struct {
 	Name string
 	Args []string
+	Env  []string
 }
 
 // fakeRunner is the exec seam's recorder: every command the drain
 // shells out lands here in order, and per-binary outcomes let the
 // specs drive failure paths (chctl drop failing → the local
-// SYSTEM DROP REPLICA fallback fires).
+// SYSTEM DROP REPLICA fallback fires). Credentials ride env, never
+// argv — the recorder captures both so the specs can pin the
+// credential transport (the drain finding: the bare client fell
+// back to the readonly `default` user).
 type fakeRunner struct {
 	commands   []recordedCommand
 	chctlFails bool
 }
 
 func (f *fakeRunner) run(_ context.Context, name string, args ...string) ([]byte, error) {
-	f.commands = append(f.commands, recordedCommand{Name: name, Args: append([]string{}, args...)})
+	return f.runWithEnv(nil, name, args...)
+}
+
+func (f *fakeRunner) runWithEnv(env []string, name string, args ...string) ([]byte, error) {
+	f.commands = append(f.commands, recordedCommand{
+		Name: name,
+		Args: append([]string{}, args...),
+		Env:  append([]string{}, env...),
+	})
 	if name == "chctl" && f.chctlFails {
 		return []byte("connection refused"), fmt.Errorf("exit status 1")
 	}
@@ -99,6 +111,9 @@ func (p *drainProvider) FetchBundle(context.Context, model.ConfigBundle, string)
 }
 
 func (p *drainProvider) ListActiveClaims(ctx context.Context, req port.ListClaimsRequest) ([]port.Claim, error) {
+	if p.lister == nil {
+		return nil, nil
+	}
 	return p.lister.ListActiveClaims(ctx, req)
 }
 
@@ -287,7 +302,11 @@ func drainFixtures() (*drainFakes, func()) {
 		ops:     &fakeClusterOps{},
 	}
 	origRun := runCommand
+	origRunWithEnv := runCommandWithEnv
 	runCommand = f.runner.run
+	runCommandWithEnv = func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+		return f.runner.runWithEnv(env, name, args...)
+	}
 	origOps := clusterOps
 	clusterOps = f.ops
 	origBuild := buildProvider
@@ -312,6 +331,7 @@ func drainFixtures() (*drainFakes, func()) {
 
 	return f, func() {
 		runCommand = origRun
+		runCommandWithEnv = origRunWithEnv
 		clusterOps = origOps
 		buildProvider = origBuild
 		inventorySpecPath = origSpec
@@ -594,6 +614,38 @@ var _ = Describe("drain", func() {
 			"clickhouse-client --query SYSTEM DROP REPLICA 'writer-1'"))
 		// The sequence still finishes: shutdown after the fallback.
 		Expect(f.runner.lines()).To(ContainElement("clickhouse-client --query SYSTEM SHUTDOWN"))
+	})
+
+	It("authenticates the drain queries as admin via env, never argv", func() {
+		// The drain finding: the bare clickhouse-client calls fell
+		// back to the `default` user, whose profile the chi spec
+		// renders readonly — the graceful-drain statements can be
+		// refused during scale-in, silently degrading writer
+		// replacement to the kill-only fallback. Credentials MUST
+		// ride env (CLICKHOUSE_USER/CLICKHOUSE_PASSWORD): argv is
+		// world-readable in /proc/<pid>/cmdline for the process's
+		// whole lifetime.
+		st := drainer()
+		f.lister.claims = []port.Claim{{Hostname: "writer-0"}}
+		provider := &drainProvider{name: "aws", lister: f.lister, claimer: f.claimer, dns: f.dns}
+
+		Expect(drain(context.Background(), st, provider, drainOptions{DeadlineSeconds: 240, Reason: drainReasonTerminationHook})).To(Succeed())
+
+		clientCalls := 0
+		for _, c := range f.runner.commands {
+			if c.Name != "clickhouse-client" {
+				continue
+			}
+			clientCalls++
+			Expect(c.Env).To(ContainElement("CLICKHOUSE_USER=admin"), "every drain query runs as admin")
+			Expect(c.Env).To(ContainElement("CLICKHOUSE_PASSWORD=sekrit"), "the password rides env from the boot's password file")
+			for _, a := range c.Args {
+				Expect(a).NotTo(Equal("sekrit"), "the password must never ride argv")
+				Expect(a).NotTo(Equal("--password"), "the password flag must never ride argv")
+				Expect(a).NotTo(Equal("admin"), "the username must never ride argv")
+			}
+		}
+		Expect(clientCalls).To(Equal(3), "stop queues, stop sends and shutdown all go through the client")
 	})
 
 	It("keeps draining with no capabilities at all (writer-0 fallback)", func() {

@@ -155,6 +155,7 @@ var _ = Describe("runDiskAutoscale", func() {
 	var statePath string
 
 	var probedArgs [][]string
+	var probedEnv [][]string
 
 	seed := func(freeGB float64) {
 		fakes = &diskAutoscaleFakes{runner: &fakeRunner{}}
@@ -181,9 +182,11 @@ var _ = Describe("runDiskAutoscale", func() {
 		DeferCleanup(func() { adminPasswordPath = origPassword })
 
 		origRun := runCommand
+		origRunWithEnv := runCommandWithEnv
 		origBuild := buildProvider
-		runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		runCommandWithEnv = func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 			probedArgs = append(probedArgs, args)
+			probedEnv = append(probedEnv, env)
 			// The free-space probe: return the seeded bytes.
 			return []byte(strconv.FormatInt(int64(freeGB*(1<<30)), 10)), nil
 		}
@@ -192,6 +195,7 @@ var _ = Describe("runDiskAutoscale", func() {
 		}
 		DeferCleanup(func() {
 			runCommand = origRun
+			runCommandWithEnv = origRunWithEnv
 			buildProvider = origBuild
 		})
 	}
@@ -206,12 +210,17 @@ var _ = Describe("runDiskAutoscale", func() {
 		// value — the bare client's `default` user is refused outright
 		// (the live 0.2.4 finding: every timer start failed on
 		// AUTHENTICATION_FAILED until the credentials were threaded).
+		// Credentials ride ENV, never argv: argv is world-readable in
+		// /proc/<pid>/cmdline for the process's whole lifetime.
 		Expect(probedArgs).NotTo(BeEmpty())
 		probe := probedArgs[0]
-		Expect(probe).To(ContainElement("--user"))
-		Expect(probe).To(ContainElement("admin"))
-		Expect(probe).To(ContainElement("--password"))
-		Expect(probe).To(ContainElement("sekrit"))
+		Expect(probe).To(ContainElement("--query"))
+		Expect(probe).NotTo(ContainElement("admin"), "the username must not ride argv")
+		Expect(probe).NotTo(ContainElement("sekrit"), "the password must not ride argv")
+		Expect(probe).NotTo(ContainElement("--password"), "the password flag must not ride argv")
+		Expect(probedEnv).NotTo(BeEmpty())
+		Expect(probedEnv[0]).To(ContainElement("CLICKHOUSE_USER=admin"))
+		Expect(probedEnv[0]).To(ContainElement("CLICKHOUSE_PASSWORD=sekrit"))
 	})
 
 	It("grows the volume and resizes the filesystem below the floor", func() {

@@ -15,7 +15,9 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/service"
 )
 
 // This file pins `chinit lease-renew` — the every-5-minute timer the
@@ -59,7 +62,17 @@ var _ = Describe("runLeaseRenew", func() {
 			return &drainProvider{name: "aws", claimer: claimer}, nil
 		}
 		Expect(os.MkdirAll(leaseRenewDir, 0755)).To(Succeed())
-		return func() { buildProvider = origBuild }
+		// Every renewal now converges /etc/hosts; redirect the seam so
+		// the suite never touches the dev machine's real hosts file
+		// (the convergence specs' own BeforeEach layers on top).
+		hostsPath := filepath.Join(leaseRenewDir, "hosts")
+		Expect(os.WriteFile(hostsPath, []byte("127.0.0.1 localhost\n"), 0644)).To(Succeed())
+		origHosts := service.PeerHostsPath()
+		service.SetPeerHostsPath(func() string { return hostsPath })
+		return func() {
+			buildProvider = origBuild
+			service.SetPeerHostsPath(origHosts)
+		}
 	}
 
 	BeforeEach(func() {
@@ -138,4 +151,86 @@ var _ = Describe("runLeaseRenew", func() {
 			Expect(err.Error()).To(ContainSubstring("no lease capability"))
 		})
 	})
+
+	// The renewal converges /etc/hosts on the same live claims — the
+	// 2026-11-15 finding's durable fix: a reader booting mid-churn
+	// wrote an empty hosts file at boot and sat DNS_ERROR-blind for
+	// hours; the every-5-minute renewal is the convergence point.
+	Context("peer-hosts convergence", func() {
+		var hostsPath string
+
+		BeforeEach(func() {
+			dir, err := os.MkdirTemp("", "chinit-lease-hosts-*")
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = os.RemoveAll(dir) })
+			hostsPath = filepath.Join(dir, "hosts")
+			Expect(os.WriteFile(hostsPath, []byte("127.0.0.1 localhost\n"), 0644)).To(Succeed())
+			orig := service.PeerHostsPath()
+			service.SetPeerHostsPath(func() string { return hostsPath })
+			DeferCleanup(func() { service.SetPeerHostsPath(orig) })
+		})
+
+		It("writes live claims' short names after renewing", func() {
+			statePath := writeLeaseState(model.NodeIdentity{
+				Role:        model.RoleReader,
+				Hostname:    "reader-0",
+				InstanceID:  "i-r0",
+				ClusterName: "logexplorer",
+				DNSZone:     "ch.internal",
+				LeaseTable:  "node-claims",
+			})
+			lister := &recordingLister{claims: []chinitport.Claim{
+				{Hostname: "writer-0", IP: "10.0.1.69", InstanceID: "i-w0"},
+				{Hostname: "reader-0", IP: "10.0.1.211", InstanceID: "i-r0"},
+			}}
+			origBuild := buildProvider
+			buildProvider = func(string, string) (chinitport.Provider, error) {
+				return &drainProvider{name: "aws", claimer: &drainClaimer{}, lister: lister}, nil
+			}
+			DeferCleanup(func() { buildProvider = origBuild })
+
+			Expect(runLeaseRenew([]string{"-state", statePath})).To(Succeed())
+
+			data, err := os.ReadFile(hostsPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(data)).To(ContainSubstring("10.0.1.69 writer-0"))
+			Expect(string(data)).To(ContainSubstring("10.0.1.211 reader-0"))
+		})
+
+		It("renews even when the claims listing fails (best-effort)", func() {
+			statePath := writeLeaseState(model.NodeIdentity{
+				Role:       model.RoleWriter,
+				Hostname:   "writer-1",
+				InstanceID: "i-w1",
+				LeaseTable: "node-claims",
+			})
+			claimer := &drainClaimer{}
+			lister := &recordingLister{err: errors.New("dynamodb outage")}
+			origBuild := buildProvider
+			buildProvider = func(string, string) (chinitport.Provider, error) {
+				return &drainProvider{name: "aws", claimer: claimer, lister: lister}, nil
+			}
+			DeferCleanup(func() { buildProvider = origBuild })
+
+			Expect(runLeaseRenew([]string{"-state", statePath})).To(Succeed())
+			Expect(claimer.renews).To(HaveLen(1))
+			data, _ := os.ReadFile(hostsPath)
+			Expect(string(data)).To(ContainSubstring("127.0.0.1 localhost"))
+		})
+	})
 })
+
+// recordingLister is the lease-listing fake for the renewal specs: it
+// reuses the drainClaimer recorder pattern (canned claims or a canned
+// failure).
+type recordingLister struct {
+	claims []chinitport.Claim
+	err    error
+}
+
+func (l *recordingLister) ListActiveClaims(context.Context, chinitport.ListClaimsRequest) ([]chinitport.Claim, error) {
+	if l.err != nil {
+		return nil, l.err
+	}
+	return l.claims, nil
+}

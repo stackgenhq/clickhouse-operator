@@ -435,7 +435,39 @@ func specInventoryHosts(st *nodeState) []clusterops.Host {
 // drain is one function over the nodeState, and the var matches the
 // package's existing seams (inventorySpecPath).
 var runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return runCommandWithEnv(ctx, nil, name, args...)
+}
+
+// runCommandWithEnv is runCommand with explicit child-process env:
+// the credential-bearing clickhouse-client calls use it to pass the
+// admin user/password via CLICKHOUSE_USER/CLICKHOUSE_PASSWORD env
+// instead of argv — argv is world-readable in /proc/<pid>/cmdline for
+// the process's whole lifetime. Credentials NEVER go on argv (the same
+// rule the clusterRequest comment states for chctl argv).
+var runCommandWithEnv = func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	return cmd.CombinedOutput()
+}
+
+// clickhouseClientEnv builds the env vars that authenticate a local
+// clickhouse-client invocation as the admin user. The password comes
+// from the boot's password file (the same source every other admin
+// credential path uses); empty when the file is absent, so a
+// passwordless cluster behaves identically. Callers MUST pass this to
+// runCommandWithEnv — a plain runCommand would silently fall back to
+// the readonly `default` user (the drain finding: bare
+// clickhouse-client calls authenticate as `default`, whose profile
+// the chi spec renders readonly, and the graceful-drain queries get
+// refused during scale-in).
+func clickhouseClientEnv() []string {
+	env := []string{"CLICKHOUSE_USER=admin"}
+	if pw := adminPassword(); pw != "" {
+		env = append(env, "CLICKHOUSE_PASSWORD="+pw)
+	}
+	return env
 }
 
 // statePathFlag parses the common -state flag.
@@ -500,8 +532,13 @@ func runReplicaSync(args []string) error {
 	return nil
 }
 
-// runLeaseRenew is `chinit lease-renew` (readers' timer): extends the
-// ordinal lease through the provider's claimer.
+// runLeaseRenew is `chinit lease-renew` (lease-mode nodes' timer): extends the
+// ordinal lease through the provider's claimer, then converges
+// /etc/hosts on the same live claims (the periodic half of the
+// peer-hosts contract — the boot step wrote the file once, but a
+// node booting mid-churn legitimately saw zero live claims; the
+// renewal is the 5-minute convergence point for short names the
+// replication queue fetches parts by).
 func runLeaseRenew(args []string) error {
 	statePath, err := statePathFlag(args)
 	if err != nil {
@@ -539,6 +576,27 @@ func runLeaseRenew(args []string) error {
 		return err
 	}
 	slog.Info("lease-renew: lease extended", "hostname", st.Identity.Hostname)
+
+	// Converge /etc/hosts on the same live claims (best-effort — a
+	// convergence failure never fails the renewal; the next tick
+	// retries). Keepers have no lease and never reach this path.
+	if st.Identity.Role != model.RoleKeeper {
+		args := service.ConvergeHostsArgs{
+			LeaseTable:  st.Identity.LeaseTable,
+			DNSZoneName: st.dnsZone(),
+		}
+		// The spec prefixes come from the bundle the boot installed;
+		// a missing/unparsable spec falls back to the shared
+		// defaults (writer-/reader-).
+		if spec, err := loadInventorySpec(); err == nil {
+			args.WriterPrefix = spec.writerPrefix()
+			args.ReaderPrefix = spec.readerPrefix()
+			args.DNSZoneName = spec.DNSZoneName
+		}
+		if err := service.ConvergePeerHosts(ctx, provider, args); err != nil {
+			slog.Warn("lease-renew: peer-hosts convergence failed", "err", err)
+		}
+	}
 	return nil
 }
 
@@ -767,19 +825,18 @@ func runDiskAutoscale(args []string) error {
 }
 
 // diskEffectiveFree queries the local server for the default disk's
-// effective free bytes (after keep_free_space). The admin password
-// file is the credential source — the bare client defaults to the
-// `default` user, whose profile is readonly on this stack and whose
-// connection is refused outright when a password is configured
-// (AUTHENTICATION_FAILED — the live 0.2.4 finding: the probe ran
-// before the password was threaded and every timer start failed).
+// effective free bytes (after keep_free_space). Credentials go to the
+// client via CLICKHOUSE_USER/CLICKHOUSE_PASSWORD env — argv is
+// world-readable in /proc/<pid>/cmdline for the process's whole
+// lifetime, env only while the reader can inspect the process. The
+// bare client defaults to the `default` user, whose profile is
+// readonly on this stack and whose connection is refused outright when
+// a password is configured (AUTHENTICATION_FAILED — the live 0.2.4
+// finding: the probe ran before the password was threaded and every
+// timer start failed).
 func diskEffectiveFree(ctx context.Context) (uint64, error) {
-	args := []string{"--user", "admin"}
-	if pw := adminPassword(); pw != "" {
-		args = append(args, "--password", pw)
-	}
-	args = append(args, "--query", diskFreeQuery)
-	out, err := runCommand(ctx, "clickhouse-client", args...)
+	args := []string{"--query", diskFreeQuery}
+	out, err := runCommandWithEnv(ctx, clickhouseClientEnv(), "clickhouse-client", args...)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1384,12 +1441,15 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 	// 1. ClickHouse-level graceful drain FIRST (parity with the
 	// operator's HostShutdown hooks): stop replication queues so no
 	// fetch/merge starts mid-shutdown; stop distributed sends so no
-	// in-flight send is cut.
+	// in-flight send is cut. Admin credentials via env (the `default`
+	// user the bare client falls back to is readonly — its profile
+	// refuses the drain statements).
+	clientEnv := clickhouseClientEnv()
 	for _, query := range []string{
 		"SYSTEM STOP REPLICATION QUEUES",
 		"SYSTEM STOP DISTRIBUTED SENDS",
 	} {
-		out, err := runCommand(drainCtx, "clickhouse-client", "--query", query)
+		out, err := runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query", query)
 		if err != nil {
 			slog.Warn("WARNING: drain query failed",
 				"query", query,
@@ -1416,7 +1476,7 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 				"err", err)
 			fmt.Fprintf(os.Stderr, "NOTE: peer replica drop on %s failed (%s); the weekly dead-replica GC will clean up\n", peer.Hostname, err)
 			// Fallback: local drop.
-			_, _ = runCommand(drainCtx, "clickhouse-client", "--query",
+			_, _ = runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query",
 				"SYSTEM DROP REPLICA '"+st.Identity.Hostname+"'")
 		}
 	}
@@ -1455,7 +1515,7 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 	}
 
 	// 4. SYSTEM SHUTDOWN: stop accepting new queries gracefully.
-	if _, err := runCommand(drainCtx, "clickhouse-client", "--query", "SYSTEM SHUTDOWN"); err != nil {
+	if _, err := runCommandWithEnv(drainCtx, clientEnv, "clickhouse-client", "--query", "SYSTEM SHUTDOWN"); err != nil {
 		slog.Warn("WARNING: graceful shutdown failed; falling back to systemctl stop", "err", err)
 		_, _ = runCommand(drainCtx, "systemctl", "stop", "clickhouse-server")
 	} else {

@@ -720,78 +720,23 @@ func setSystemHostname(ctx context.Context, hostname string) error {
 // has no live claim it gets no hosts line — DNS (self-registered at
 // claim) is the source of truth, and an absent peer is unreachable
 // either way.
+//
+// The boot step is the FIRST pass, not the only one: the periodic
+// convergence (the lease-renew timer's service.ConvergePeerHosts)
+// owns the ongoing correctness, because a node booting mid-churn
+// sees zero live writer claims and legitimately writes an empty
+// hosts file here (the 2026-11-15 finding: 0s step, hours of
+// DNS_ERROR until a human patched hosts by hand).
 func (b *Boot) configurePeerHosts(ctx context.Context) error {
 	// Keepers register themselves in Keeper's own host records; the
 	// short-name problem is a server-node concern.
 	if b.Spec.Role == model.RoleKeeper {
 		return nil
 	}
-
-	// Sweep every prior writer/reader line first: a re-run must
-	// converge on the current claims, not preserve whatever an older
-	// boot wrote.
-	if existing, err := os.ReadFile("/etc/hosts"); err == nil {
-		var kept []string
-		for _, line := range strings.Split(string(existing), "\n") {
-			stale := false
-			for _, prefix := range []string{b.Spec.WriterPrefix(), b.Spec.ReaderPrefix(), "writer-", "reader-"} {
-				for _, field := range strings.Fields(line) {
-					if strings.HasPrefix(field, prefix) {
-						stale = true
-						break
-					}
-				}
-				if stale {
-					break
-				}
-			}
-			if !stale {
-				kept = append(kept, line)
-			}
-		}
-		if err := os.WriteFile("/etc/hosts", []byte(strings.Join(kept, "\n")+"\n"), 0644); err != nil {
-			return Fatal(fmt.Errorf("rewrite /etc/hosts: %w", err))
-		}
-	} else {
-		return Fatal(fmt.Errorf("read /etc/hosts: %w", err))
-	}
-
-	// The inventory addresses are DNS names; /etc/hosts needs IPs. The
-	// lease table carries both — list the claims directly (the same
-	// scan the inventory runs; a node claiming mid-sweep simply joins
-	// on its own DNS record).
-	var entries strings.Builder
-	if lister := port.AsLeaseLister(b.Provider); lister != nil && b.Identity.LeaseTable != "" {
-		claims, err := lister.ListActiveClaims(ctx, port.ListClaimsRequest{Table: b.Identity.LeaseTable})
-		if err != nil {
-			// Best-effort: the hosts file is an optimization over DNS
-			// (self-registered at claim); a listing outage must not
-			// abort the boot over short-name resolution.
-			fmt.Fprintf(os.Stderr, "WARNING: live-claims listing for /etc/hosts failed (%s); short names resolve via DNS\n", err)
-			return nil
-		}
-		for _, claim := range claims {
-			writer := strings.HasPrefix(claim.Hostname, b.Spec.WriterPrefix()) || strings.HasPrefix(claim.Hostname, "writer-")
-			reader := strings.HasPrefix(claim.Hostname, b.Spec.ReaderPrefix()) || strings.HasPrefix(claim.Hostname, "reader-")
-			if !writer && !reader {
-				continue // foreign row (backup-0, keeper-N): not fetch sources
-			}
-			if claim.IP == "" {
-				continue
-			}
-			fmt.Fprintf(&entries, "%s %s %s.%s\n", claim.IP, claim.Hostname, claim.Hostname, b.Spec.DNSZoneName)
-		}
-	}
-	if entries.Len() > 0 {
-		f, err := os.OpenFile("/etc/hosts", os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return Fatal(fmt.Errorf("open /etc/hosts: %w", err))
-		}
-		if _, err := f.WriteString(entries.String()); err != nil {
-			_ = f.Close()
-			return Fatal(fmt.Errorf("append /etc/hosts: %w", err))
-		}
-		_ = f.Close()
-	}
-	return nil
+	return ConvergePeerHosts(ctx, b.Provider, ConvergeHostsArgs{
+		LeaseTable:   b.Identity.LeaseTable,
+		WriterPrefix: b.Spec.WriterPrefix(),
+		ReaderPrefix: b.Spec.ReaderPrefix(),
+		DNSZoneName:  b.Spec.DNSZoneName,
+	})
 }
