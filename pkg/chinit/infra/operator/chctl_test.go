@@ -414,6 +414,41 @@ func TestConfigRendererNoInventoryUnchanged(t *testing.T) {
 		"no inventory: operator-native host names must be kept")
 }
 
+// TestConfigRendererDropsVacantSlots asserts the lease-mode render:
+// the CR reserves N slots, the live-claims inventory maps only the
+// claimed ones — the vacant slots' pod-pattern <replica> blocks must
+// be dropped from remote_servers entirely (they never resolve
+// off-cluster and were the dominant error-stream source: every
+// cluster fan-out retried them and logged DNS failures hundreds of
+// times an hour, the 2026-11-15 live finding).
+func TestConfigRendererDropsVacantSlots(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+	// Widen the layout the way the Terraform render does for ASG fleets:
+	// the CR reserves slots up to the ASG max, live claims cover fewer.
+	cluster := cr.Spec.Configuration.Clusters[0]
+	cluster.Layout.Shards[0].ReplicasCount = 3
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		// Only slot 0-0 has a live claim; 0-1 and 0-2 are vacant.
+		Hosts: []domain.HostIdentity{
+			{Name: "0-0", Address: "writer-0.ch-int-dev.clickhouse.internal"},
+		},
+		Replicas: map[string]string{"0-0": "writer-0"},
+	})
+
+	remote := files["chop-generated-remote_servers.xml"]
+	require.Contains(t, remote, "<host>writer-0.ch-int-dev.clickhouse.internal</host>",
+		"the live slot keeps its cloud address")
+	require.NotContains(t, remote, "chi-ch-int-dev-logexplorer-0-1",
+		"vacant slot 0-1 must not render a pod-pattern host")
+	require.NotContains(t, remote, "chi-ch-int-dev-logexplorer-0-2",
+		"vacant slot 0-2 must not render a pod-pattern host")
+	require.Contains(t, remote, "</replica>",
+		"at least the live replica block survives the filter")
+}
+
 func TestConfigRendererRenderCHK(t *testing.T) {
 	chkSpec := []byte(`
 apiVersion: clickhouse-keeper.altinity.com/v1

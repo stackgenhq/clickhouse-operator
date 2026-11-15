@@ -113,6 +113,25 @@ func (r *ConfigRenderer) RenderCHI(ctx context.Context, request port.RenderCHIRe
 	commonFiles := filesGenerator.CreateConfigFiles(interfaces.FilesGroupCommon, chiConfig.NewFilesGeneratorOptions())
 	rendered = append(rendered, toRenderedFiles("common", commonFiles)...)
 
+	// Lease-mode fleets render the CR's RESERVED slots; the cloud namer
+	// translates only the slots with live claims to cloud DNS. A vacant
+	// slot's <host> stays in the operator's pod pattern
+	// (chi-<CR>-<cluster>-<shard>-<replica>) — unresolvable off-cluster
+	// and the direct cause of the DNSResolver/DDLWorker error storm
+	// (every cluster fan-out retries the dead slots and ClickHouse
+	// logs "Cannot resolve host" / "Not found address of host" for each,
+	// hundreds of times an hour; the 2026-11-15 live finding: 688
+	// error-stream events per 10 minutes, 92% of them DNS/DDL over
+	// vacant-slot names). Drop untranslated <replica> blocks from
+	// remote_servers BEFORE credential injection — the surviving
+	// entries keep the generator's own layout, so the credentials
+	// splice format stays intact.
+	if len(hostInventory(request.Hosts)) > 0 {
+		if err := dropVacantReplicas(rendered); err != nil {
+			return nil, err
+		}
+	}
+
 	// Per-replica distributed-query credentials are a chctl-only
 	// concern: the operator's generator has no <user>/<password> support
 	// (its cluster-level <secret> element is rejected by ClickHouse
@@ -1109,6 +1128,100 @@ func toRenderedFiles(group string, files map[string]string) []port.RenderedFile 
 		return rendered[i].Path < rendered[j].Path
 	})
 	return rendered
+}
+
+// dropVacantReplicas removes <replica> blocks whose <host> is still in
+// the operator's pod pattern (chi-<CR>-<cluster>-<shard>-<replica>) —
+// the CR reserves slots up to the ASG max, but only slots with LIVE
+// lease claims get a cloud DNS address from the namer. A vacant slot's
+// raw pod-pattern host never resolves off-cluster: every distributed
+// query, DDL worker pass and clusterAllReplicas fan-out retries it and
+// logs DNS failures (the 2026-11-15 live finding — the dominant error
+// source on the fleet's error stream once everything else healed).
+//
+// Format contract: the generator writes each <replica> block between
+// one "<replica>" open tag and "</replica>" with fixed indentation
+// (the same deterministic layout injectReplicaCredentials keys on).
+// A block whose <host> value matches the pod pattern is dropped whole;
+// a file with NO pod-pattern hosts (static inventory: every CR host has
+// an address) passes through byte-identical.
+func dropVacantReplicas(rendered []port.RenderedFile) error {
+	for i, file := range rendered {
+		if filepath.Base(file.Path) != "chop-generated-remote_servers.xml" {
+			continue
+		}
+		if !strings.Contains(file.Content, "chi-") {
+			continue // nothing untranslated in this cluster section
+		}
+		filtered, changed, err := filterReplicaBlocks(file.Content)
+		if err != nil {
+			return fmt.Errorf("%s: %w", file.Path, err)
+		}
+		if changed {
+			rendered[i].Content = filtered
+		}
+	}
+	return nil
+}
+
+// filterReplicaBlocks strips pod-pattern <replica> blocks from one
+// remote_servers document. Line-based over the generator's fixed
+// layout: a block starts at the "<replica>" line and ends at the
+// "</replica>" line; the block's <host> line carries the address.
+func filterReplicaBlocks(content string) (string, bool, error) {
+	lines := strings.Split(content, "\n")
+	var kept []string
+	var block []string
+	inBlock := false
+	changed := false
+	flush := func() {
+		if len(block) == 0 {
+			return
+		}
+		vacant := false
+		for _, l := range block {
+			t := strings.TrimSpace(l)
+			if strings.HasPrefix(t, "<host>chi-") && strings.HasSuffix(t, "</host>") {
+				vacant = true
+				break
+			}
+		}
+		if vacant {
+			changed = true
+		} else {
+			kept = append(kept, block...)
+		}
+		block = nil
+	}
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t == "<replica>" {
+			if inBlock {
+				return "", false, fmt.Errorf("nested <replica> blocks")
+			}
+			inBlock = true
+			block = append(block, l)
+			continue
+		}
+		if t == "</replica>" {
+			if !inBlock {
+				return "", false, fmt.Errorf("</replica> without <replica>")
+			}
+			block = append(block, l)
+			inBlock = false
+			flush()
+			continue
+		}
+		if inBlock {
+			block = append(block, l)
+		} else {
+			kept = append(kept, l)
+		}
+	}
+	if inBlock {
+		return "", false, fmt.Errorf("unterminated <replica> block")
+	}
+	return strings.Join(kept, "\n"), changed, nil
 }
 
 // injectReplicaCredentials splices <user>/<password> children into
