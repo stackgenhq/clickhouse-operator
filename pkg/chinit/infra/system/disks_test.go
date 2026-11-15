@@ -250,6 +250,7 @@ var _ = Describe("DiskManager.MountAll", func() {
 			script("blkid -l -o device -t LABEL=ch-metadata", "").
 			fail("test -b /dev/sdf").
 			fail("test -b /dev/sdb").
+			fail("test -b /dev/nvme0n1").
 			fail("test -b /dev/nvme1n1").
 			fail("test -b /dev/xvdf").
 			fail("test -b /dev/xvdb")

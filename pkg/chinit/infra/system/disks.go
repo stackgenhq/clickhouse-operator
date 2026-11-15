@@ -58,10 +58,20 @@ func NewDiskManager(runner Runner) *DiskManager {
 //     disk's declared LUN, unlike /dev/sd* which reorders)
 // The label check still wins when present; candidates only cover
 // first-boot formatting.
+//
+// nvme0n1 joins the metadata/keeper lists (and nvme2n1 stays on cache):
+// the NVMe enumeration order is not stable across instance families —
+// the live 2026-11-15 r8g.2xlarge roll enumerated the ROOT disk as
+// nvme1n1 and the metadata volume as nvme0n1, so the metadata
+// resolver (whose candidate list stopped at nvme1n1) never probed the
+// actually-attached volume and aborted the boot with "not found" on
+// every r8g node. The partition-table guard is the safety net that
+// keeps the OS disk unadoptable: root's GPT signature is skipped, and
+// only a BLANK or already-labeled data disk wins.
 const (
-	awsMetadataCandidates = "/dev/sdf /dev/sdb /dev/nvme1n1 /dev/xvdf /dev/xvdb"
+	awsMetadataCandidates = "/dev/sdf /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/xvdf /dev/xvdb"
 	awsCacheCandidates    = "/dev/sdg /dev/sdc /dev/nvme2n1 /dev/xvdg /dev/xvdc"
-	awsKeeperCandidates   = "/dev/sdf /dev/sdb /dev/nvme1n1 /dev/xvdf /dev/xvdb"
+	awsKeeperCandidates   = "/dev/sdf /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/xvdf /dev/xvdb"
 
 	azureMetadataCandidates = "/dev/disk/azure/scsi1/lun0"
 	azureCacheCandidates    = "/dev/disk/azure/scsi1/lun1"
