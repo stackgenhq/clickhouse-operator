@@ -53,66 +53,86 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 	configs := system.NewStaticConfigInstaller(runner).WithRole(b.Spec.Role)
 
 	steps := []Step{
-		// 1. Fetch the config bundle (replaces bootstrap.sh stage-1).
-		// SHA mismatch inside is Fatal — no retry.
-		StepFunc("fetch_config_bundle", Critical, apiRetry, func(ctx context.Context) error {
-			_, err := b.Provider.FetchBundle(ctx, b.Spec.ConfigBundle, BootstrapDir)
-			return err
-		}),
+		// PHASE 1 (parallel): the boot's wall-clock poles are IO-bound
+		// and INDEPENDENT — the claim sweep can legally wait out a
+		// predecessor's lease for many minutes (claimSweep's 16-min
+		// deadline) while the bundle downloads, EBS attaches and the
+		// kernel settings apply. Running them together pays the MAX
+		// of the poles instead of the SUM; each child keeps its own
+		// retry policy and criticality (a Critical failure cancels
+		// the siblings — see ParallelGroup).
+		ParallelGroup{Children: []Step{
+			// 1. Fetch the config bundle.
+			// SHA mismatch inside is Fatal — no retry.
+			StepFunc("fetch_config_bundle", Critical, apiRetry, func(ctx context.Context) error {
+				_, err := b.Provider.FetchBundle(ctx, b.Spec.ConfigBundle, BootstrapDir)
+				return err
+			}),
 
-		// 2-3. OS tuning + binary presence. THP/limits are convergent;
-		// a missing AMI binary is Fatal (the ASG must replace the node).
-		StepFunc("os_optimizations", Critical, onceFatal, func(ctx context.Context) error {
-			return tuner.Tune(ctx)
-		}),
-		StepFunc("require_binaries", Critical, onceFatal, func(ctx context.Context) error {
-			// clickhouse binaries: every cloud. The render and the
-			// recurring-job subcommands are in-process library calls —
-			// no chctl binary. The `aws` CLI is AWS-only — an Azure
-			// node never has it, and requiring it there would fail every
-			// boot fatally.
-			bins := []string{"clickhouse-server", "clickhouse-client"}
-			if b.Provider.Name() == "aws" {
-				bins = append(bins, "aws")
-			}
-			return tuner.RequireBinaries(ctx, bins)
-		}),
+			// 2-3. OS tuning + binary presence. THP/limits are convergent;
+			// a missing AMI binary is Fatal (the ASG must replace the node).
+			StepFunc("os_optimizations", Critical, onceFatal, func(ctx context.Context) error {
+				return tuner.Tune(ctx)
+			}),
+			StepFunc("require_binaries", Critical, onceFatal, func(ctx context.Context) error {
+				// clickhouse binaries: every cloud. The render and the
+				// recurring-job subcommands are in-process library calls —
+				// no chctl binary. The `aws` CLI is AWS-only — an Azure
+				// node never has it, and requiring it there would fail every
+				// boot fatally.
+				bins := []string{"clickhouse-server", "clickhouse-client"}
+				if b.Provider.Name() == "aws" {
+					bins = append(bins, "aws")
+				}
+				return tuner.RequireBinaries(ctx, bins)
+			}),
 
-		// 4. Mount data disks (metadata Critical; cache/keeper degrade
-		// inside). EBS volumes attach asynchronously — bootWait covers
-		// the window the bash script slept through.
-		StepFunc("mount_data_disks", Critical, bootWait, func(ctx context.Context) error {
-			_, err := disks.MountAll(ctx, *b.Spec, nil)
-			return err
-		}),
+			// 4. Mount data disks (metadata Critical; cache/keeper degrade
+			// inside). EBS volumes attach asynchronously — bootWait covers
+			// the attach window.
+			StepFunc("mount_data_disks", Critical, bootWait, func(ctx context.Context) error {
+				_, err := disks.MountAll(ctx, *b.Spec, nil)
+				return err
+			}),
 
-		// 5. Static configs: validate + install + retire overlays.
+			// 6. Identity settles BEFORE any render (the ip-* macro bug:
+			// ASG members must claim their ordinal before macros render). The
+			// claimer is an optional capability — static identity (keepers,
+			// backup — and the interim static-writer path) needs no claim.
+			// Concurrent-safety: the claim touches only the provider (the
+			// lease table + DNS), sharing no files with the phase siblings.
+			StepFunc("settle_identity", Critical, claimSweep, b.settleIdentity),
+
+			// 7. Passwords land BEFORE the render (passwordFrom refs and
+			// the distributed-query password files the render consumes).
+			// Writes 0600 files under BootstrapDir — distinct names from
+			// the bundle's files, so the concurrent fetch races nothing.
+			StepFunc("retrieve_passwords", Critical, apiRetry, b.retrievePasswords),
+
+			// 7b. TLS material: server cert/key/CA from the cloud secret
+			// store, or self-signed interserver-only when no TLS secrets
+			// are configured (acm mode: the NLB terminates client TLS, the
+			// interserver port still requires the files to EXIST). Writes
+			// only /etc/clickhouse-server/ssl — no phase sibling touches it.
+			StepFunc("configure_tls", Critical, apiRetry, b.configureTLS),
+		}},
+
+		// PHASE 2 (serial): everything below reads what phase 1 wrote —
+		// the render needs the identity, the passwords and the bundle;
+		// the server start needs the render; the units need the server.
+
+		// 5. Static configs: validate + install + retire overlays
+		// (reads the fetched bundle).
 		StepFunc("install_static_configs", Critical, onceFatal, func(ctx context.Context) error {
 			return configs.Install(ctx, BootstrapDir)
 		}),
-
-		// 6. Identity settles BEFORE any render (the ip-* macro bug:
-		// ASG members must claim their ordinal before macros render). The
-		// claimer is an optional capability — static identity (keepers,
-		// backup — and the interim static-writer path) needs no claim.
-		StepFunc("settle_identity", Critical, claimSweep, b.settleIdentity),
 
 		// 5b. Peer /etc/hosts entries: short names must resolve
 		// locally (systemd-resolved's stub breaks short-name DNS and
 		// the replication queue addresses the leader by its SHORT
 		// name — Cannot resolve host writer-0 stalls every part
-		// fetch; the bash era's configure_peer_hosts step).
+		// fetch). Needs the settled identity (the lease table scan).
 		StepFunc("configure_peer_hosts", Critical, onceFatal, b.configurePeerHosts),
-
-		// 7. Passwords land BEFORE the render (passwordFrom refs and
-		// the distributed-query password files the render consumes).
-		StepFunc("retrieve_passwords", Critical, apiRetry, b.retrievePasswords),
-
-		// 7b. TLS material: server cert/key/CA from the cloud secret
-		// store, or self-signed interserver-only when no TLS secrets
-		// are configured (acm mode: the NLB terminates client TLS, the
-		// interserver port still requires the files to EXIST).
-		StepFunc("configure_tls", Critical, apiRetry, b.configureTLS),
 
 		// 7c. Server environment: /etc/default/clickhouse-server + the
 		// systemd EnvironmentFile drop-in. storage.xml resolves the S3
@@ -124,7 +144,13 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		StepFunc("render_node_config", Critical, onceFatal, b.renderNodeConfig),
 
 		// 9. Keeper config (keeper nodes only) + state cleanup.
-		StepFunc("configure_keeper", BestEffort, onceFatal, b.configureKeeper),
+		// CRITICAL for keepers (the step no-ops for every other role):
+		// keeper launches with an explicit --config, so without this
+		// render it runs whatever stale config the image left behind —
+		// a misconfigured RAFT member can disrupt the ensemble quorum
+		// itself. A BestEffort classification made a keeper-node
+		// boot "succeed" while the cluster lost its coordination.
+		StepFunc("configure_keeper", Critical, onceFatal, b.configureKeeper),
 
 		// 10. The identity contract file for legacy unit consumers.
 		StepFunc("write_node_env", BestEffort, onceFatal, func(ctx context.Context) error {
@@ -146,10 +172,25 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		StepFunc("prometheus_reload", BestEffort, bootWait, b.prometheusReload),
 
 		// 14. Recurring-job units (chinit subcommands as ExecStart).
-		StepFunc("install_units", BestEffort, onceFatal, b.installUnits),
+		// CRITICAL for prod: the units carry the node's identity
+		// lifecycle — lease-renew is what keeps the ordinal claim
+		// alive (a node that boots WITHOUT it loses its lease 15
+		// minutes later and another instance claims the same
+		// ordinal: two nodes serving one identity is the worst
+		// failure this pipeline can produce), schema-sync is what
+		// materializes this node's tables, disk-autoscale is the
+		// merge-stall early-warning. A boot that "succeeds" without
+		// them is a liability, not a node — the ASG replacement a
+		// Critical failure triggers is the remedy.
+		StepFunc("install_units", Critical, onceFatal, b.installUnits),
 
-		// 15. Backup (clickhouse-backup config + timer).
-		StepFunc("configure_backup", BestEffort, onceFatal, b.configureBackup),
+		// 15. Backup (clickhouse-backup config + timer). CRITICAL when
+		// the operator EXPLICITLY pinned a backup bucket: a silent
+		// no-backup node is a data-loss risk discovered at restore
+		// time. The step no-ops cleanly when backups are not
+		// configured (bucket empty) or the binary is absent (a
+		// deliberate, warned, non-cluster choice).
+		StepFunc("configure_backup", Critical, onceFatal, b.configureBackup),
 
 		// 16. Monitoring agents (OTEL/Fluent Bit remote shipping;
 		// CloudWatch agent on AWS — chinit owns it now, the image only
@@ -157,13 +198,20 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		StepFunc("configure_monitoring", BestEffort, onceFatal, b.configureMonitoring),
 		StepFunc("configure_cloudwatch", BestEffort, onceFatal, b.configureCloudWatch),
 
-		// 17. Spot watcher service (readers).
+		// 17. Spot watcher service (readers). BestEffort stays: the
+		// spot notice is an optimization over the shutdown drain +
+		// the lease TTL (a missed notice costs a 15-minute ghost
+		// window, not identity theft), and spot-capability is a
+		// cloud property the boot must not die on.
 		StepFunc("install_spot_watch", BestEffort, onceFatal, b.installSpotWatch),
 
 		// 18. In-node shutdown drain unit (writers + readers): the
 		// systemd stop-path drain — closes the scale-in/health-check/
 		// spot-deadline gaps the hook's SSM dispatch cannot reach.
-		StepFunc("install_shutdown_drain", BestEffort, onceFatal, b.installShutdownDrain),
+		// CRITICAL for prod: a node without it terminates cold and
+		// leaves exactly the stale-DNS/lease residue the 2026-11-15
+		// soak found wedging the fleet's cluster fan-outs.
+		StepFunc("install_shutdown_drain", Critical, onceFatal, b.installShutdownDrain),
 
 		// 19. boot-finished marker (health verification greps it).
 		StepFunc("boot_finished", Critical, onceFatal, func(ctx context.Context) error {

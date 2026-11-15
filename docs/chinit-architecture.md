@@ -89,30 +89,58 @@ proof the contract holds.
 `boot.Steps(ctx)` → `engine.Run(ctx, steps)`. The step list is the
 architecture's spine (`pkg/chinit/domain/service/steps.go`):
 
+**Phase 1 runs concurrently** (a `ParallelGroup` — errgroup under the
+hood, see "The retry engine" below): the boot's wall-clock poles are
+IO-bound and INDEPENDENT — the claim sweep can legally wait out a
+predecessor's lease for many minutes while the bundle downloads, EBS
+attaches and the kernel settings apply. The phase pays the MAX of the
+poles, not the sum. Each child keeps its own retry policy and
+criticality; the FIRST Critical child failure cancels the siblings
+(their contexts abort) and aborts the boot; BestEffort children
+record-and-continue exactly as serial ones do; resume is per-CHILD
+(a group re-run skips only the children the state file records done).
+Children write disjoint files by construction (the claim touches only
+the lease table and DNS; the passwords write 0600 files under the
+bundle dir; TLS writes only the ssl dir; the tuning writes sysctls) —
+adding a child requires proving that disjointness, not assuming it.
+
 | # | Step | Crit | Policy | What it does / why here |
 |---|------|------|--------|-------------------------|
-| 1 | `fetch_config_bundle` | Critical | apiRetry | S3/Blob fetch of the XMLs + chi.yaml + keeper.yaml; the SHA256 gate is Fatal (a stale hash means the spec does not vouch for these bytes) |
-| 2 | `os_optimizations` | Critical | onceFatal | THP off, limits, sysctls — convergent probes first |
-| 3 | `require_binaries` | Critical | onceFatal | clickhouse binaries present; the `aws` CLI check is cloud-gated (an Azure node never has it) |
-| 4 | `mount_data_disks` | Critical | bootWait | mount by LABEL (NVMe renames device paths); ownership; the keeper state dirs prepared and chowned |
-| 5 | `install_static_configs` | Critical | onceFatal | the bundle's XMLs → `/etc/clickhouse-server/config.d` |
-| 6 | `settle_identity` | Critical | claimSweep | the identity contract (below); persists immediately |
-| 7 | `configure_peer_hosts` | Critical | onceFatal | `/etc/hosts` entries for writer short names — the replication queue addresses the leader by short name and systemd-resolved does not answer short names |
-| 8 | `retrieve_passwords` | Critical | apiRetry | secrets → 0600 files; values never enter state or logs |
-| 9 | `configure_tls` | Critical | apiRetry | TLS material from the cloud store, or self-signed interserver-only when no secrets are configured |
-| 10 | `configure_server_env` | Critical | onceFatal | `/etc/default/clickhouse-server` + the systemd drop-in; `storage.xml`'s `from_env` endpoint is a start requirement (Code 36), not a warning |
+| 1 | `fetch_config_bundle` | Critical | apiRetry | **[phase 1]** S3/Blob fetch of the XMLs + chi.yaml + keeper.yaml; the SHA256 gate is Fatal (a stale hash means the spec does not vouch for these bytes) |
+| 2 | `os_optimizations` | Critical | onceFatal | **[phase 1]** THP off, limits, sysctls — convergent probes first |
+| 3 | `require_binaries` | Critical | onceFatal | **[phase 1]** clickhouse binaries present; the `aws` CLI check is cloud-gated (an Azure node never has it) |
+| 4 | `mount_data_disks` | Critical | bootWait | **[phase 1]** mount by LABEL (NVMe renames device paths); ownership; the keeper state dirs prepared and chowned |
+| 6 | `settle_identity` | Critical | claimSweep | **[phase 1]** the identity contract (below); persists immediately; concurrently-safe (touches only the provider) |
+| 8 | `retrieve_passwords` | Critical | apiRetry | **[phase 1]** secrets → 0600 files; values never enter state or logs; distinct filenames from the bundle |
+| 9 | `configure_tls` | Critical | apiRetry | **[phase 1]** TLS material from the cloud store, or self-signed interserver-only when no secrets are configured; writes only the ssl dir |
+| 5 | `install_static_configs` | Critical | onceFatal | **[phase 2]** the bundle's XMLs → `/etc/clickhouse-server/config.d` (reads what phase 1 fetched) |
+| 7 | `configure_peer_hosts` | Critical | onceFatal | **[phase 2]** `/etc/hosts` entries for writer short names — the replication queue addresses the leader by short name and systemd-resolved does not answer short names; needs the settled identity |
+| 10 | `configure_server_env` | Critical | onceFatal | **[phase 2]** `/etc/default/clickhouse-server` + the systemd drop-in; `storage.xml`'s `from_env` endpoint is a start requirement (Code 36), not a warning |
 | 11 | `render_node_config` | Critical | onceFatal | the whole node config through the in-process render library (below) |
-| 12 | `configure_keeper` | BestEffort | onceFatal | keeper nodes: single-file render + myid/raft-id discipline + service enable; no-ops for others |
+| 12 | `configure_keeper` | Critical | onceFatal | keeper nodes: single-file render + myid/raft-id discipline + service enable; no-ops for others — a keeper joining with a stale --config disrupts the raft ensemble itself (the role gate keeps every non-keeper boot unaffected) |
 | 13 | `write_node_env` | BestEffort | onceFatal | the shell-contract file for anything not yet on typed state |
 | 14 | `start_clickhouse` | Critical | onceFatal | enable, start, wait for `/ping`, S3-disk health probe; keepers return immediately |
 | 15 | `health_gate` | BestEffort | onceFatal | the in-process health fan-out with the CR inventory; non-fatal BY DESIGN so a reader booting while a peer is down still joins |
 | 16 | `prometheus_reload` | BestEffort | bootWait | reload + wait for the metrics endpoint; restart fallback |
-| 17 | `install_units` | BestEffort | onceFatal | the recurring-job units (below) |
-| 18 | `configure_backup` | BestEffort | onceFatal | clickhouse-backup config + daily timer (backup replica only) |
+| 17 | `install_units` | Critical | onceFatal | the recurring-job units (below): lease-renew keeps the ordinal claim alive (an expired claim is identity theft — another instance claims the same ordinal), schema-sync materializes the node's tables, disk-autoscale is the merge-stall early warning |
+| 18 | `configure_backup` | Critical | onceFatal | clickhouse-backup config + daily timer — no-ops cleanly when backups are not configured; when the operator EXPLICITLY pinned a bucket, a silent no-backup node is a restore-time data-loss discovery |
 | 19 | `configure_monitoring` | BestEffort | onceFatal | OTEL/Fluent Bit shipping; silently disabled when the endpoint is empty |
 | 20 | `install_spot_watch` | BestEffort | onceFatal | readers on spot-capable clouds: the drain daemon |
-| 21 | `install_shutdown_drain` | BestEffort | onceFatal | writers + readers: the in-node shutdown drain unit (below) |
+| 21 | `install_shutdown_drain` | Critical | onceFatal | writers + readers: the in-node shutdown drain unit (below) — a node without it terminates cold and leaks the stale-DNS/lease residue |
 | 22 | `boot_finished` | Critical | onceFatal | the final timing summary |
+
+**The criticality question, stated once**: Critical means "a node
+that boots WITHOUT this step is a liability as a cluster member" — it
+holds an identity it cannot renew, a keeper seat with a stale config,
+a termination path that leaks residue, or an operator-promised backup
+that does not exist. BestEffort means "observable-by-absence or
+environment-shaped": the health gate (a reader joining mid-churn must
+still join — the gate wedge was a real boot-loop incident), metrics
+reload, log shipping, the spot watcher. A boot that "succeeds" while
+skipping a Critical step is worse than a boot that fails: the ASG
+replacement the failure triggers IS the remedy. The matrix is pinned
+by specs (`criticality_test.go`) — a future edit answers for its
+failure mode instead of defaulting to "continue".
 
 Three deliberate orderings, all paid for in production findings:
 

@@ -32,7 +32,10 @@ import (
 	"io"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
@@ -236,6 +239,68 @@ func (s stepFunc) Criticality() Criticality      { return s.crit }
 func (s stepFunc) Policy() Policy                { return s.policy }
 func (s stepFunc) Run(ctx context.Context) error { return s.run(ctx) }
 
+// ParallelGroup is a Step that runs its children CONCURRENTLY and
+// completes when every child has (the barrier). It exists because the
+// boot's wall-clock poles are IO-bound and INDEPENDENT: the ordinal
+// claim sweep (settle_identity) can legally wait out a predecessor's
+// lease for many minutes while the bundle fetch, EBS attach and OS
+// tuning all run — serializing them pays the sum instead of the max.
+//
+// Criticality semantics inside a group:
+//   - ANY Critical child failing fails the group Criticalally and
+//     cancels the group's remaining children (a failed disk mount
+//     must not leave the node half-converged while TLS writes files).
+//   - A BestEffort child failing alone is recorded and the group
+//     succeeds — the same log-and-continue contract a standalone
+//     BestEffort step has. BestEffort children are NOT cancel-safe
+//     to skip: their work (monitoring, units) is orthogonal, and the
+//     serial engine never skipped them on a sibling's failure either.
+//
+// Each child runs under ITS OWN retry Policy (the group adds no retry
+// of its own), and state recording is per-child (a resume skips only
+// the children that completed — the group re-runs the rest).
+type ParallelGroup struct {
+	Children []Step
+}
+
+// Name reports the group's phase name ("phase: a|b|c" — the [TIMING]
+// line and state file carry it; children keep their own names).
+func (g ParallelGroup) Name() string {
+	names := make([]string, 0, len(g.Children))
+	for _, c := range g.Children {
+		names = append(names, c.Name())
+	}
+	return "phase: " + strings.Join(names, "|")
+}
+
+// Criticality answers Critical when ANY child is Critical (a Critical
+// child's failure must abort the boot, so the group must be able to
+// convey it — see runGroup).
+func (g ParallelGroup) Criticality() Criticality {
+	for _, c := range g.Children {
+		if c.Criticality() == Critical {
+			return Critical
+		}
+	}
+	return BestEffort
+}
+
+// Policy answers the default single-attempt policy: the group itself
+// is a barrier, not an operation — retries belong to each child.
+func (g ParallelGroup) Policy() Policy { return Policy{Attempts: 1} }
+
+// Run is unreachable through the engine (the engine dispatches groups
+// via the type assertion, never calling Run) but satisfies the Step
+// interface so a group can nest inside steps slices and dry-run plans.
+func (g ParallelGroup) Run(ctx context.Context) error {
+	for _, c := range g.Children {
+		if err := c.Run(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Engine runs the ordered pipeline with state tracking, retries and the
 // [TIMING] summary.
 type Engine struct {
@@ -377,6 +442,8 @@ func (o StepOutcome) Failed() bool { return o.Err != nil }
 // state file records done), retries (each step's Policy), criticality
 // (stop or continue), and the fatal-error short-circuit. A Critical
 // failure aborts remaining steps; a BestEffort failure continues.
+// A ParallelGroup runs its children concurrently (errgroup) with the
+// same resume/criticality semantics per child.
 func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 	res := RunResult{Steps: make([]StepOutcome, 0, len(steps))}
 
@@ -409,7 +476,49 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 		state.SpecHash = e.specHash
 	}
 
+	// record is the ONE state-mutation path for the run AND the
+	// parallel groups (the mutex makes concurrent child recording
+	// safe; the store save stays caller-owned to keep the ordering
+	// observable in tests).
+	record := func(r stepRecord) {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		state.recordStep(r)
+	}
+
+	aborted := false
 	for _, st := range steps {
+		if aborted {
+			break
+		}
+		if group, ok := st.(ParallelGroup); ok {
+			outcomes := e.runGroup(ctx, group, state, record)
+			// The FIRST Critical failure in child order is the
+			// fatality (deterministic: outcomes are indexed by
+			// child). A cancelled sibling's ctx error is plain
+			// (Do wraps it "retry window exhausted") — it must not
+			// overwrite the FatalError that identifies the failed
+			// step for FatalityStep()/triage.
+			for _, o := range outcomes {
+				if o.Err != nil && o.Crit == Critical && res.Fatality == nil {
+					res.Fatality = o.Err
+				}
+			}
+			if res.Fatality != nil {
+				aborted = true
+			}
+			res.Steps = append(res.Steps, outcomes...)
+			if aborted {
+				if e.stateStore != nil {
+					_ = e.stateStore.Save(state)
+				}
+				return res
+			}
+			if e.stateStore != nil {
+				_ = e.stateStore.Save(state)
+			}
+			continue
+		}
 		outcome := StepOutcome{Name: st.Name(), Crit: st.Criticality()}
 
 		// Resume: a step recorded done (and not superseded by a newer
@@ -419,7 +528,10 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 		// node onto the CURRENT spec/bundle even when nothing else
 		// changed since the last boot.
 		if !e.refresh {
-			if prior := state.findStep(st.Name()); prior != nil && prior.Status == "done" {
+			state.mu.Lock()
+			prior := state.findStep(st.Name())
+			state.mu.Unlock()
+			if prior != nil && prior.Status == "done" {
 				outcome.Skipped = true
 				res.Steps = append(res.Steps, outcome)
 				continue
@@ -436,7 +548,7 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 		if errors.As(err, &fe) {
 			fe.Step = st.Name()
 		}
-		state.recordStep(stepRecord{
+		record(stepRecord{
 			Name:       st.Name(),
 			Status:     statusOf(err),
 			DurationMs: outcome.Duration.Milliseconds(),
@@ -469,6 +581,65 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 	return res
 }
 
+// runGroup runs a ParallelGroup's children concurrently (errgroup,
+// one goroutine per child, unbounded: the group is sized by the boot
+// pipeline, not user input). Semantics mirror the serial loop per
+// child: resume-skip, the child's own Policy, per-child state
+// recording — with two group-level rules (see ParallelGroup's doc):
+// the FIRST Critical child failure cancels the siblings and fails
+// the group; BestEffort failures record and continue.
+func (e *Engine) runGroup(ctx context.Context, group ParallelGroup, state *modelState, record func(stepRecord)) []StepOutcome {
+	g, gctx := errgroup.WithContext(ctx)
+	outcomes := make([]StepOutcome, len(group.Children))
+
+	for i, child := range group.Children {
+		i, child := i, child // capture (pre-1.22 loop vars; Go 1.21 builds)
+		outcomes[i] = StepOutcome{Name: child.Name(), Crit: child.Criticality()}
+
+		// Resume per child, under the same state lock as the serial
+		// path (the findStep read races nothing: children of one
+		// group have distinct names, and the serial path is not
+		// running concurrently).
+		state.mu.Lock()
+		prior := state.findStep(child.Name())
+		state.mu.Unlock()
+		if !e.refresh && prior != nil && prior.Status == "done" {
+			outcomes[i].Skipped = true
+			continue
+		}
+
+		g.Go(func() error {
+			start := e.clock.Now()
+			err := Do(gctx, child.Policy(), child.Run)
+			outcomes[i].Duration = e.clock.Since(start)
+			outcomes[i].Err = err
+
+			var fe *FatalError
+			if errors.As(err, &fe) {
+				fe.Step = child.Name()
+			}
+			record(stepRecord{
+				Name:       child.Name(),
+				Status:     statusOf(err),
+				DurationMs: outcomes[i].Duration.Milliseconds(),
+				StartedAt:  start.UTC().Format(time.RFC3339),
+			})
+
+			// errgroup's contract: the first non-nil return cancels
+			// gctx (the siblings' in-flight work aborts through their
+			// contexts) and becomes Wait's error. BestEffort failures
+			// are recorded in outcomes and swallowed here — the group
+			// continues exactly as the serial loop would.
+			if err != nil && child.Criticality() == Critical {
+				return err
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return outcomes
+}
+
 // Since is the Clock's duration helper.
 func (e *Engine) Since(t time.Time) time.Duration { return e.clock.Now().Sub(t) }
 
@@ -483,6 +654,11 @@ func statusOf(err error) string {
 // file (kept separate from the model types so the engine owns resume
 // semantics and the model stays a plain data description).
 type modelState struct {
+	// mu guards Steps (and the identity write) across the parallel
+	// groups' concurrent child recording. The zero value is ready;
+	// JSON marshaling copies field-by-field (Load/Save happen outside
+	// any group's lifetime).
+	mu sync.Mutex `json:"-"`
 	// Identity is the settled snapshot (claimed/derived hostname, CR
 	// name, lease, zone) — the recurring-job subcommands reload it
 	// instead of re-deriving (the node-env contract, typed).

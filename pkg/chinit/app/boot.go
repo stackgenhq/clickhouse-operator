@@ -118,6 +118,13 @@ func runBoot(args []string) error {
 	if flags.dryRun {
 		fmt.Println("Dry-run: the pipeline would run these steps in order:")
 		for _, st := range steps {
+			if group, ok := st.(service.ParallelGroup); ok {
+				fmt.Printf("  %-24s [%s] (children run concurrently)\n", st.Name(), st.Criticality())
+				for _, child := range group.Children {
+					fmt.Printf("    %-22s [%s]\n", child.Name(), child.Criticality())
+				}
+				continue
+			}
 			fmt.Printf("  %-24s [%s]\n", st.Name(), st.Criticality())
 		}
 		return nil
