@@ -9,23 +9,28 @@
 cloud: it detects the platform it runs on (AWS, Azure; more via the provider
 factory), fetches its configuration bundle, converges the node to a
 declarative spec and installs its own recurring maintenance jobs as
-subcommands. It replaces the 3,170-line Terraform-templated `cloud-init.sh`
-stage-2 script **and** the `bootstrap.sh` stage-1 downloader — the entire
-bootstrap is one binary plus one small YAML spec.
+subcommands — the entire lifecycle, first boot to termination, is one
+binary plus one small YAML spec.
 
-## Why you'd use it
+## Why it exists
 
-| The bash era | chinit |
+Bootstrapping a stateful, replicated database fleet on auto-scaling cloud
+infrastructure is a problem full of races and failure modes. A node is not
+a pet: instances launch, scale in, get replaced by health checks and spot
+reclaims — and every one of those events must leave the cluster's identity
+state consistent. The problems chinit is built to solve:
+
+| The problem | How chinit solves it |
 |---|---|
-| ~40 Terraform variables interpolated into 3,170 lines of shell at template time | `chinit.yaml` — a typed, validated spec fetched (SHA256-gated) from object storage; the binary is identical across roles and clouds |
-| ~16 ad-hoc `sleep` retry loops, `set -e` toggling between fatal and best-effort | A retry engine: Retryable/Fatal error classification, exponential backoff with jitter, per-step deadlines, Critical/BestEffort criticality |
-| A re-run redid everything (or failed halfway) | Convergence: every step probes real system state first; `state.json` records done steps and resumes; a new bundle hash invalidates and re-renders |
-| systemd units whose ExecStart were *more embedded bash* (schema-sync, replica-sync, spot drain, lease renewal, keeper health, GCs, backup) | `chinit schema-sync`, `replica-sync`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch` — units are one ExecStart line, all logic testable Go |
-| Graceful shutdown = hope the scale-in hook's SSM command reached a stopping instance (it often didn't — SSM races the agent's own teardown; an EC2 health-check termination never fires the hook at all) | `chinit-shutdown-drain.service` (v0.2.15): ExecStop runs `chinit drain-shutdown` inside systemd's shutdown transaction, ordered `After=clickhouse-server` — the ONE path every termination mode goes through, with a reboot guard (`reboot.target` → skip: identity survives a reboot) |
-| A dead node's DNS record kept answering its IP until the lease TTL (15 min) or a human noticed | The `lease-renew` tick converges the private zone (`ConvergePeerDNS`, v0.2.14): self-record upsert + expired-slot record sweep — residue heals within one 5-minute tick |
-| Cloud CLI calls shelled out (aws/az) with hand-built JSON | Provider adapters over the SDKs: Secrets Manager/Key Vault, DynamoDB/Table Storage ordinal leases, Route53/Private DNS, S3/Blob bundle fetch, IMDSv2 |
-| Nothing testable | Unit tests per package + a **provider conformance suite**: one contract, run per cloud against fake IMDS/canned secrets/canned bundle |
-| Azure port = copy 2,461 lines of bash and swap `az` for `aws` | One `infra/azure` package implementing the same ports; GCP/Civo are one package + one registry line each |
+| Node configuration has to differ per instance (identity, IPs, role) while staying identical in logic — templating config into per-node variants drifts and is untestable | `chinit.yaml` — a typed, validated spec fetched (SHA256-gated) from object storage; the binary is identical across roles and clouds, only the spec is per-role |
+| Cloud APIs are flaky and every failure needs a deliberate answer (retry? abort? degrade loudly?) — ad-hoc retries either mask bugs or wedge boots | A retry engine: Retryable/Fatal error classification, exponential backoff with jitter, per-step deadlines, Critical/BestEffort criticality |
+| A boot that crashes halfway and re-runs from scratch is slow and unsafe (re-claiming identity mid-flight can renumber a live cluster member) | Convergence: every step probes real system state first; `state.json` records done steps and resumes; a new bundle hash invalidates and re-renders |
+| Post-boot maintenance (schema sync, replica sync, lease renewal, keeper health, GCs, backups, spot handling, graceful shutdown) needs to run on schedule, on the right node, with the right identity | Subcommands: `chinit schema-sync`, `replica-sync`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown` — units are one ExecStart line, all logic testable Go |
+| A terminating instance must release its identity (ordinal lease, DNS record, replica registration) — but an ASG scale-in's SSM dispatch races the agent's own teardown, and an EC2 health-check termination never fires the hook at all | `chinit-shutdown-drain.service` (v0.2.15): ExecStop runs `chinit drain-shutdown` inside systemd's shutdown transaction, ordered `After=clickhouse-server` — the ONE path every termination mode goes through, with a reboot guard (`reboot.target` → skip: identity survives a reboot) |
+| A dead node's DNS record keeps answering its IP until the lease TTL (15 min) or a human notices — every cluster fan-out resolves the dead name and stalls | The `lease-renew` tick converges the private zone (`ConvergePeerDNS`, v0.2.14): self-record upsert + expired-slot record sweep — residue heals within one 5-minute tick |
+| Cloud CLI calls with hand-built JSON are fragile and per-cloud ports don't compose | Provider adapters over the SDKs: Secrets Manager/Key Vault, DynamoDB/Table Storage ordinal leases, Route53/Private DNS, S3/Blob bundle fetch, IMDSv2 |
+| Nothing testable — a boot change means a live-fleet experiment | Unit tests per package + a **provider conformance suite**: one contract, run per cloud against fake IMDS/canned secrets/canned bundle |
+| A new cloud means a rewrite | One `infra/azure` package implementing the same ports; GCP/Civo are one package + one registry line each |
 
 ## How it adapts to the cloud
 
@@ -69,7 +74,8 @@ fetch_config_bundle → os_optimizations → require_binaries → mount_data_dis
 
 The settled identity (hostname, CR name, lease, DNS zone) is persisted to
 `/var/lib/chinit/state.json` at claim time — the job subcommands reload
-it, never re-derive (the typed version of the bash node-env contract).
+it, never re-derive (the step-13 `node-env` shell contract remains
+for unit scripts not yet on typed state).
 
 ### The termination side (v0.2.15)
 
@@ -100,7 +106,8 @@ stop replication queues → stop distributed sends → peer DROP REPLICA
 
 The settled identity (hostname, CR name, lease, DNS zone) is persisted to
 `/var/lib/chinit/state.json` at claim time — the job subcommands reload
-it, never re-derive (the typed version of the bash node-env contract).
+it, never re-derive (the step-13 `node-env` shell contract remains
+for unit scripts not yet on typed state).
 
 ### `chinit boot --refresh`
 
@@ -153,12 +160,12 @@ region: us-east-1
 ## Get the binary
 
 ```bash
-CHINIT_VERSION=v0.1.0
+CHINIT_VERSION=v0.2.15
 curl -fsSL -o chinit \
-  "https://github.com/sks/clickhouse-operator/releases/download/chinit-${CHINIT_VERSION}/chinit-linux-arm64"
+  "https://github.com/sks/clickhouse-operator/releases/download/${CHINIT_VERSION}/chinit-linux-arm64"
 chmod +x chinit
 # supply-chain gate:
-curl -fsSL "https://github.com/sks/clickhouse-operator/releases/download/chinit-${CHINIT_VERSION}/chinit-SHA256SUMS" | grep arm64 | sha256sum -c
+curl -fsSL "https://github.com/sks/clickhouse-operator/releases/download/${CHINIT_VERSION}/chinit-SHA256SUMS" | grep arm64 | sha256sum -c
 ```
 
 Releases build from the `chinit-v*` tag workflow (vet+test gate, then
@@ -177,8 +184,8 @@ EC2/VM user_data shrinks to a ~1.5KB wrapper:
 2. fetch the role's `chinit-<role>.yaml` from the bundle prefix
 3. `exec chinit boot -spec /var/lib/clickhouse-bootstrap/chinit.yaml -cloud aws`
 
-Everything the bash era did at boot — and everything its cron/systemd
-litter did after — is chinit now.
+The whole node lifecycle — first boot, recurring maintenance, and
+termination cleanup — is chinit now.
 
 ## Layout
 

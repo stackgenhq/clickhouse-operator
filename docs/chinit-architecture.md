@@ -3,10 +3,10 @@
 `chinit` bootstraps a ClickHouse node on any cloud: it detects the
 platform, fetches a SHA-gated config bundle, converges the node to a
 declarative spec, and installs its own recurring maintenance jobs as
-subcommands. [chinit.md](chinit.md) is the user-facing doc — what it
-replaces, how to wire it into node boot. This doc is for contributors:
-how the binary is put together, why each layer exists, and where the
-load-bearing decisions live.
+subcommands. [chinit.md](chinit.md) is the user-facing doc — why it
+exists, the problems it solves, how to wire it into node boot. This
+doc is for contributors: how the binary is put together, why each
+layer exists, and where the load-bearing decisions live.
 
 ## The shape in one paragraph
 
@@ -146,9 +146,9 @@ claimSweep = Policy{Attempts: 3, BaseDelay: 5s, MaxDelay: 5s}    // ordinal clai
 Criticality decides what a *failure* means: a Critical step failing
 aborts the boot with a non-zero exit (an ASG member then gets
 replaced — the node cannot self-heal a broken disk or wrong image);
-a BestEffort step logs and continues. The bash era encoded this
-distinction as `set +e`/`set -e` toggling and sixteen ad-hoc sleep
-loops; here it is one table row per step.
+a BestEffort step logs and continues. The classification is a design
+decision per step, stated up front — one table row per step, not a
+runtime guess.
 
 ### Convergence and resume: the state contract
 
@@ -179,9 +179,9 @@ type modelState struct {
   reason.
 
 The subcommands (`schema-sync`, `replica-sync`, `dead-replica-gc`, …)
-reload `state.json` and never re-derive identity — the typed version
-of the bash era's `node-env` shell contract, which step 13 still
-writes for anything not yet migrated to typed state.
+reload `state.json` and never re-derive identity — identity is typed
+state, settled once; the step-13 `node-env` shell contract remains
+only for unit scripts not yet migrated to typed state.
 
 ## Identity: two modes, one naming contract
 
@@ -264,9 +264,8 @@ safety — the ensemble's identity outlives the instance), is seeded
 
 ## The recurring jobs: subcommands as the unit interface
 
-Everything the bash era's cron litter and embedded-bash systemd units
-did after boot is a `chinit` subcommand. Units are one `ExecStart`
-line — logic lives in testable Go:
+Every recurring maintenance job after boot is a `chinit` subcommand.
+Units are one `ExecStart` line — logic lives in testable Go:
 
 | Unit (service/timer) | ExecStart | Roles | Cadence |
 |---|---|---|---|
@@ -304,10 +303,10 @@ a warning; the reader pass still ran. the gc request carries the exclude set for
 ## The termination story: three triggers, one drain sequence
 
 A node's identity — the ordinal lease, the DNS A record, the replica
-registration — outlives the instance by default. The bash era left the
-cleanup to whichever path happened to notice the death; the chinit
-design runs the SAME drain sequence (`chinit drain`) from three
-triggers, each covering a termination mode the others cannot reach:
+registration — outlives the instance by default. Nothing in the
+infrastructure releases it on death; the chinit design runs the SAME
+drain sequence (`chinit drain`) from three triggers, each covering a
+termination mode the others cannot reach:
 
 | Trigger | Termination modes | Why it exists |
 |---|---|---|
