@@ -21,6 +21,8 @@ bootstrap is one binary plus one small YAML spec.
 | ~16 ad-hoc `sleep` retry loops, `set -e` toggling between fatal and best-effort | A retry engine: Retryable/Fatal error classification, exponential backoff with jitter, per-step deadlines, Critical/BestEffort criticality |
 | A re-run redid everything (or failed halfway) | Convergence: every step probes real system state first; `state.json` records done steps and resumes; a new bundle hash invalidates and re-renders |
 | systemd units whose ExecStart were *more embedded bash* (schema-sync, replica-sync, spot drain, lease renewal, keeper health, GCs, backup) | `chinit schema-sync`, `replica-sync`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch` — units are one ExecStart line, all logic testable Go |
+| Graceful shutdown = hope the scale-in hook's SSM command reached a stopping instance (it often didn't — SSM races the agent's own teardown; an EC2 health-check termination never fires the hook at all) | `chinit-shutdown-drain.service` (v0.2.15): ExecStop runs `chinit drain-shutdown` inside systemd's shutdown transaction, ordered `After=clickhouse-server` — the ONE path every termination mode goes through, with a reboot guard (`reboot.target` → skip: identity survives a reboot) |
+| A dead node's DNS record kept answering its IP until the lease TTL (15 min) or a human noticed | The `lease-renew` tick converges the private zone (`ConvergePeerDNS`, v0.2.14): self-record upsert + expired-slot record sweep — residue heals within one 5-minute tick |
 | Cloud CLI calls shelled out (aws/az) with hand-built JSON | Provider adapters over the SDKs: Secrets Manager/Key Vault, DynamoDB/Table Storage ordinal leases, Route53/Private DNS, S3/Blob bundle fetch, IMDSv2 |
 | Nothing testable | Unit tests per package + a **provider conformance suite**: one contract, run per cloud against fake IMDS/canned secrets/canned bundle |
 | Azure port = copy 2,461 lines of bash and swap `az` for `aws` | One `infra/azure` package implementing the same ports; GCP/Civo are one package + one registry line each |
@@ -50,7 +52,7 @@ DNS) still boots — the pipeline degrades loudly instead of failing.
 
 ## The boot
 
-`chinit boot` runs 18 convergent steps in a load-bearing order (identity
+`chinit boot` runs 22 convergent steps in a load-bearing order (identity
 settles **before** renders — the "ip-10-0-1-101 never joined the cluster"
 production finding; passwords land **before** the render; keepers skip the
 server start; the health gate is non-fatal so a reader booting while a peer
@@ -62,8 +64,39 @@ fetch_config_bundle → os_optimizations → require_binaries → mount_data_dis
 → render_node_config (in-process library — no process boundary)
 → configure_keeper → write_node_env → start_clickhouse → health_gate
 → prometheus_reload → install_units → configure_backup → configure_monitoring
-→ install_spot_watch → boot_finished
+→ install_spot_watch → install_shutdown_drain → boot_finished
 ```
+
+The settled identity (hostname, CR name, lease, DNS zone) is persisted to
+`/var/lib/chinit/state.json` at claim time — the job subcommands reload
+it, never re-derive (the typed version of the bash node-env contract).
+
+### The termination side (v0.2.15)
+
+Boot installs the units; teardown runs them. Every writer and reader
+carries `chinit-shutdown-drain.service` — a no-op-at-start unit whose
+**ExecStop** runs `chinit drain-shutdown` when systemd stops it at OS
+shutdown (ordered `After=clickhouse-server`, so the drain runs against a
+still-live server):
+
+```
+stop replication queues → stop distributed sends → peer DROP REPLICA
+→ DNS A-record DELETE → ordinal lease release → parting zone sweep
+(other expired-slot records)
+```
+
+- **Reboots are exempt**: `reboot.target` in `systemctl list-jobs` makes
+  the drain decline — a reboot reloads the same node, and its identity
+  must survive.
+- **The server stop is skipped** (`SkipServerShutdown`): the drain runs
+  INSIDE the shutdown transaction; issuing stop commands would fight the
+  very teardown that invoked it.
+- **Why in-node**: the OS shutdown path is the ONE signal every
+  termination mode goes through — ASG scale-in, EC2 health-check
+  replacement (which never fires the ASG termination hook), spot reclaim
+  at the deadline, operator stop. The hook's SSM dispatch races the
+  agent's own teardown and cannot cover all of these; the systemd stop
+  path has no delivery race at all.
 
 The settled identity (hostname, CR name, lease, DNS zone) is persisted to
 `/var/lib/chinit/state.json` at claim time — the job subcommands reload

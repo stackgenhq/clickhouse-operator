@@ -111,7 +111,8 @@ architecture's spine (`pkg/chinit/domain/service/steps.go`):
 | 18 | `configure_backup` | BestEffort | onceFatal | clickhouse-backup config + daily timer (backup replica only) |
 | 19 | `configure_monitoring` | BestEffort | onceFatal | OTEL/Fluent Bit shipping; silently disabled when the endpoint is empty |
 | 20 | `install_spot_watch` | BestEffort | onceFatal | readers on spot-capable clouds: the drain daemon |
-| 21 | `boot_finished` | Critical | onceFatal | the final timing summary |
+| 21 | `install_shutdown_drain` | BestEffort | onceFatal | writers + readers: the in-node shutdown drain unit (below) |
+| 22 | `boot_finished` | Critical | onceFatal | the final timing summary |
 
 Three deliberate orderings, all paid for in production findings:
 
@@ -196,10 +197,10 @@ machines keep fixed addresses; identity derives from the address.
 **Lease mode** (readers, and writers on ASG-only stacks): an ordinal
 claim against the provider's lease table (DynamoDB on AWS, Table
 Storage on Azure) — a conditional write that succeeds only if the row
-is free or its lease expired, renewed by timer, released on spot
-drain. The claim ceiling is the role's ASG **max** (`reader_max` /
-`writer_max`), not today's count: a scale-out past the baseline must
-be able to claim, or it boots forever identity-less.
+is free or its lease expired, renewed by timer, **released by the
+shutdown drain** (below). The claim ceiling is the role's ASG **max**
+(`reader_max` / `writer_max`), not today's count: a scale-out past the
+baseline must be able to claim, or it boots forever identity-less.
 
 Both modes then derive the **CR name** — the identity the Altinity
 operator's machinery uses (`CRName()` in `boot.go`). The CR layout
@@ -272,11 +273,12 @@ line — logic lives in testable Go:
 | `schema-sync` | `chinit schema-sync -retries 3 -prune-stale-self` | writer, reader | hourly |
 | `replica-sync` | `chinit replica-sync` | writer, reader | post-boot |
 | `keeper-health` | `chinit keeper-health` | keeper | timer |
-| `lease-renew` | `chinit lease-renew` | leased nodes (writers + readers) | every 5 min |
+| `lease-renew` | `chinit lease-renew` | leased nodes (writers + readers) | every 5 min — also converges `/etc/hosts` and the private zone (the DNS self-heal, v0.2.14) |
 | `dead-replica-gc` | `chinit dead-replica-gc` | writers (runs on the ordinal-0 holder) | weekly |
 | `orphaned-data-gc` | `chinit orphaned-gc` | writers (runs on the ordinal-0 holder) | weekly |
 | `clickhouse-backup-daily` | `chinit backup-daily` | backup replica | daily 02:00 |
 | `chinit-spot-watch` | `chinit spot-watch` | spot readers | daemon |
+| `chinit-shutdown-drain` | `chinit drain-shutdown` (at **ExecStop**, not ExecStart) | writers + readers | once per OS shutdown |
 
 Each subcommand is a thin orchestration over the **in-process clusterops port** for
 cluster operations (schema sync, replica sync, replica gc, replica drop, keeper mntr) —
@@ -298,6 +300,85 @@ table's active claims first and passes every live writer as an exclude entry on 
 fresh (a mid-boot re-join) is reported but never dropped. No
 lease-listing capability or a scan failure skips the writer pass with
 a warning; the reader pass still ran. the gc request carries the exclude set for exactly this guard.
+
+## The termination story: three triggers, one drain sequence
+
+A node's identity — the ordinal lease, the DNS A record, the replica
+registration — outlives the instance by default. The bash era left the
+cleanup to whichever path happened to notice the death; the chinit
+design runs the SAME drain sequence (`chinit drain`) from three
+triggers, each covering a termination mode the others cannot reach:
+
+| Trigger | Termination modes | Why it exists |
+|---|---|---|
+| **In-node shutdown drain** (`chinit-shutdown-drain.service`, v0.2.15) | ALL: ASG scale-in, EC2 health-check replacement, spot reclaim at the deadline, operator stop | The OS shutdown path is the ONE signal every mode goes through. systemd runs the drain from inside the node — no external dispatch, no delivery race. |
+| **ASG termination lifecycle hook** (the stack's writer_drain module → SSM `chinit drain -reason termination-hook`) | ASG scale-ins and instance refreshes | Belt-and-suspenders: the hook holds the terminating phase open (300 s heartbeat) while the drain runs, catching what the OS drain misses. |
+| **Spot watcher** (`chinit spot-watch`, readers) | Spot reclaims, 2 minutes before the deadline | The notice's deadline lets the drain finish BEFORE the reclaim — the replacement can re-claim the ordinal immediately. |
+
+### The in-node shutdown drain (the primary layer)
+
+`install_shutdown_drain` (boot step 21) writes
+`chinit-shutdown-drain.service` on every writer and reader:
+
+- **A no-op unit whose ExecStop is the point.** `ExecStart=/bin/true`
+  with `RemainAfterExit=yes` leaves the unit "active" so systemd has
+  something to stop; `ExecStop=/usr/local/bin/chinit drain-shutdown`
+  runs at teardown.
+- **Ordering is the design.** `After=network-online.target
+  clickhouse-server.service` means systemd's shutdown stops units in
+  REVERSE dependency order — the drain runs while ClickHouse is still
+  up to serve the peer drop and the `SYSTEM STOP` queries, then the
+  server stops.
+- **`SkipServerShutdown`** — the shutdown drain never issues
+  `SYSTEM SHUTDOWN` nor `systemctl stop clickhouse-server`: it runs
+  INSIDE the shutdown transaction that invoked it, and a stop job
+  waiting on a stop job is a deadlock.
+- **The reboot guard.** A reboot reloads the same node with the same
+  identity — its lease, DNS record and replica registration must all
+  survive. `drain-shutdown` reads `systemctl list-jobs` and declines
+  (exit 0, loud log) when `reboot.target` is the pending job. The
+  check is best-effort: a systemd IPC failure assumes TERMINATION
+  (a skipped drain on a real termination is the costlier failure; the
+  lease TTL and the weekly GC are the safety nets).
+- **Budget discipline.** The drain's own deadline is 150 s; the
+  unit's `TimeoutStopSec` is 170 s — both under EC2's 180 s
+  API-driven shutdown window, so the drain is never the reason a
+  termination is killed mid-drain.
+- **The parting zone sweep.** After releasing its own record, the
+  dying node sweeps the zone's OTHER expired-slot records
+  (`SweepExpiredSlotRecords` — the sweep half of the DNS convergence
+  below, WITHOUT the self-heal upsert, which would re-create the
+  record the drain just deleted). A terminating node next to an
+  undrained predecessor heals that predecessor's stale record
+  immediately instead of waiting for the next renewal tick elsewhere.
+- **Keepers and backup are excluded** (the role gate): keepers hold
+  no lease and run no clickhouse-server; the backup replica's
+  identity must survive shutdowns.
+
+**Failure is CONTINUE, by design** — the same contract as the hook:
+the node is stateless (parts durable in object storage, quorum spans
+the shard), a failed drain logs loudly, and the safety nets (lease
+TTL 15 min, weekly dead-replica GC, the periodic DNS convergence)
+clean the residue.
+
+### The periodic DNS convergence (the self-healing net, v0.2.14)
+
+Every `lease-renew` tick (5 min) converges, best-effort:
+
+- **`/etc/hosts`** (`ConvergePeerHosts`, v0.2.7): sweep + rewrite the
+  short-name lines from the live claims — replication queues fetch
+  parts by bare hostname and systemd-resolved will not answer short
+  names.
+- **The private DNS zone** (`ConvergePeerDNS`): upsert SELF (the
+  settled identity is authoritative for its own record even after an
+  ASG re-IP), then delete every ordinal name whose lease expired —
+  the A record a missed drain leaves points at a dead IP and wedges
+  every cluster fan-out that resolves it.
+
+The sweep is race-safe by construction: a replacement claims the
+ordinal BEFORE it boots (the claim row is live by then), so a record
+whose lease is live is never a delete candidate; an expired lease
+has no holder by definition.
 
 ## The conformance suite: one contract, every cloud
 
@@ -334,6 +415,20 @@ pinned by a test, not by convention.
    as a new chinit release (the golden image bakes it, checksummed);
    the spec changes what the same binary targets. Never smuggle logic
    into the spec template.
+7. **The drain runs inside the transaction it must not fight.** The
+   shutdown drain is an ExecStop: it releases identity (DNS, lease,
+   replica registration) and STOPS — it never issues stop commands
+   against services systemd is already stopping under it (a stop job
+   waiting on a stop job is a deadlock), and it never runs on a reboot
+   (identity survives a reboot; `drain-shutdown` declines on
+   `reboot.target`).
+8. **Cleanup has three layers on purpose.** The shutdown drain (every
+   termination mode, in-node), the ASG hook (scale-ins, held open with
+   heartbeats), and the periodic DNS convergence (the 5-minute
+   self-heal). Removing one layer is fine only if the failure mode it
+   uniquely covers is acceptable — the health-check termination covers
+   ONLY the shutdown drain, and the "SSM could not deliver" case
+   covers only the other two.
 
 ## Where to look in the tree
 
@@ -349,7 +444,9 @@ pkg/chinit/domain/
   service/steps.go                the pipeline table, identity, TLS, env
   service/engine.go               retry Do(), state store, shared-state discipline
   service/render.go               in-process library renders (node + keeper)
-  service/units.go                unit composition per role
+  service/units.go                unit composition per role (incl. the shutdown-drain unit)
+  service/hosts.go                the /etc/hosts convergence (lease-renew tick)
+  service/peerdns.go              the private-zone convergence (lease-renew tick) + the parting sweep
   service/conformance/            the provider contract suite
   fail/                           Retryable/Fatal classification
 pkg/chinit/infra/
