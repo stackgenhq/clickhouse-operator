@@ -523,10 +523,22 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	}
 	adminPw := strings.TrimSpace(string(pw))
 
-	// Statement-split: the DDL is one statement per terminator; empty
-	// segments (comments' trailing semicolons, blank lines) skip.
+	// Statement-split: one statement per TOP-LEVEL terminator. The DDL
+	// carries SQL comments (-- headers explaining each object) and
+	// parenthesized defaults like CODEC(ZSTD(1)) / toIntervalDay(7) —
+	// a naive strings.Split(";") shreds both (the live 2026-11-15
+	// finding: the first statement arrived at the server still
+	// prefixed by the comment text "chinit's bootstrap_schema boot
+	// step executes it" — Code 62 at position 1 — and a CODEC's own
+	// paren split mid-expression; five of eight statements failed,
+	// leaving a churned fleet WITHOUT its S3Queue drain surface).
+	// The splitter is comment-aware (line comments removed before
+	// splitting; ClickHouse DDL in this bundle uses no block comments)
+	// and delimiter-depth-aware (semicolons inside parentheses —
+	// functions, codecs, tuples — never terminate a statement).
+	statements := splitSQLStatements(string(data))
 	created := 0
-	for _, stmt := range strings.Split(string(data), ";") {
+	for _, stmt := range statements {
 		s := strings.TrimSpace(stmt)
 		if s == "" || !strings.Contains(s, "CREATE") {
 			continue
@@ -544,6 +556,54 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	}
 	fmt.Printf("schema bootstrap: %d statement(s) applied from %s\n", created, ddlPath)
 	return nil
+}
+
+// splitSQLStatements splits a DDL file into statements on top-level
+// semicolons: line comments (-- to end-of-line) are stripped first,
+// and semicolons inside parentheses never terminate a statement.
+//
+// Why a dedicated function (not strings.Split): the bootstrap bundle's
+// DDL carries explanatory comments and CODEC/interval defaults whose
+// parentheses would otherwise shred statements into server-side
+// syntax errors (Code 62) — the exact class the naive split produced
+// live. The depth counter treats parentheses as the only nesting
+// signal: single quotes are not tracked because the bundle carries no
+// string literals containing semicolons or parens; a future bundle
+// needing them should extend this with a quote state.
+func splitSQLStatements(sql string) []string {
+	var statements []string
+	var current strings.Builder
+	depth := 0
+	for _, line := range strings.Split(sql, "\n") {
+		// Strip line comments outside parens: a "--" inside a string
+		// literal would corrupt, but the bundle's comments live at line
+		// starts and after whitespace only (the file's own convention).
+		if idx := strings.Index(line, "--"); idx >= 0 && depth == 0 {
+			line = line[:idx]
+		}
+		for _, r := range line {
+			switch r {
+			case '(':
+				depth++
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+			case ';':
+				if depth == 0 {
+					statements = append(statements, current.String())
+					current.Reset()
+					continue
+				}
+			}
+			current.WriteRune(r)
+		}
+		current.WriteRune('\n')
+	}
+	if strings.TrimSpace(current.String()) != "" {
+		statements = append(statements, current.String())
+	}
+	return statements
 }
 
 // execClient runs one SQL statement as admin over the local client (the
