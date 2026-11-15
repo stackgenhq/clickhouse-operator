@@ -1506,6 +1506,10 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 		if err := claimer.ReleaseLease(drainCtx, port.ReleaseRequest{
 			Table:    st.Identity.LeaseTable,
 			Hostname: st.Identity.Hostname,
+			// Ownership guard input: the drain of the OLD instance is
+			// a no-op on a claim its replacement already re-claimed
+			// (the instance-refresh overlap race).
+			InstanceID: st.Identity.InstanceID,
 		}); err != nil {
 			slog.Warn("WARNING: drain lease release failed",
 				"hostname", st.Identity.Hostname,

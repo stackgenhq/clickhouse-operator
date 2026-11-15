@@ -531,9 +531,11 @@ var _ = Describe("drain", func() {
 		Expect(drops[0].Cluster.ClusterName).To(Equal("logexplorer"))
 		Expect(drops[0].Cluster.Credentials.Password).To(Equal("sekrit"))
 
-		// The lease went back to the table.
+		// The lease went back to the table — scoped to THIS instance
+		// (the ownership guard: a drain overlapping its replacement's
+		// re-claim must not delete the new node's row).
 		Expect(f.claimer.releases).To(Equal([]port.ReleaseRequest{
-			{Table: "node-claims", Hostname: "writer-1"},
+			{Table: "node-claims", Hostname: "writer-1", InstanceID: "i-w1"},
 		}))
 		// The A record went away.
 		Expect(f.dns.deletes).To(HaveLen(1))

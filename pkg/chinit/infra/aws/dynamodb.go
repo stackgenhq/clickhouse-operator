@@ -194,8 +194,32 @@ func (c *DynamoDBClaimer) Release(ctx context.Context, req chinitport.ReleaseReq
 	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: awsString(req.Table),
 		Key:       claimKey(req.Hostname),
+		// OWNERSHIP-GUARDED delete: a termination/drain releases only
+		// the claim THIS instance holds. The unconditional delete was
+		// the 2026-11-15 replacement race: the terminating node's drain
+		// ran AFTER its replacement had re-claimed the ordinal (the
+		// instance-refresh overlap), deleting the replacement's fresh
+		// row — the new node could then never renew
+		// (ConditionalCheckFailedException on every lease-renew) and
+		// its identity went unclaimed while it kept serving as
+		// writer-N. Deleting with instance_id = :me makes the overlap
+		// safe: the drain of the OLD instance is a no-op on the NEW
+		// instance's claim.
+		ConditionExpression: awsString("instance_id = :me"),
+		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+			":me": &dynamodbtypes.AttributeValueMemberS{Value: req.InstanceID},
+		},
 	})
-	return err
+	if err != nil {
+		// Someone else owns the name now (the replacement re-claimed
+		// before this drain released): the correct outcome, not an
+		// error — the claim is live and managed.
+		if isConditionalCheckFailed(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // claimKey builds the hostname key attribute.

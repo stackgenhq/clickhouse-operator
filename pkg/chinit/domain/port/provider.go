@@ -111,6 +111,11 @@ type RenewRequest struct {
 type ReleaseRequest struct {
 	Table    string
 	Hostname string
+	// InstanceID scopes the release to the claim THIS instance holds
+	// (the ownership guard): a drain overlapping its replacement's
+	// re-claim must not delete the new node's row. Providers without
+	// an ownership concept may ignore it.
+	InstanceID string
 }
 
 // DNSRegistrar manages the node's private-zone A record. Readers
