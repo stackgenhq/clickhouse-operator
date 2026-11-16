@@ -79,41 +79,44 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 			"default": withSubnet(b.Spec.Network.DefaultUserAllowedNetworks, b.Spec.Network.SubnetCIDR),
 		},
 	}
-	if b.Spec.Role != model.RoleBackup {
-		// The inventory host list renders remote_servers; writers and
-		// readers are both CR members. The DNS-zone addressing is the
-		// same convention the CHI spec's templates carry. The list is
-		// built ONCE here (live-claims discovery is a lease-table scan;
-		// the replica map and remote_servers must never disagree by
-		// racing two scans).
-		hosts, note := b.clusterHostsWithSource()
-		if note != "" {
-			slog.Warn(note)
-			fmt.Fprintln(os.Stderr, note)
-		}
-		request.Hosts = hosts
-		// Replica names (the {replica} macro value): without this map
-		// the macros render the operator's POD pattern
-		// (chi-<chi>-<cluster>-<shard>-<replica>) as the replica
-		// identity — the keeper replica_path then registers under a
-		// name no cloud tooling recognizes, and SYSTEM SYNC REPLICA
-		// / DROP REPLICA operate on the wrong identity (the live
-		// chinit-cutover finding). The bash era passed -replica
-		// 01-$idx=$hostname.
-		request.Replicas = map[string]string{}
-		for _, h := range hosts {
-			request.Replicas[h.Name] = strings.SplitN(h.Address, ".", 2)[0]
-		}
-		// Distributed-query credentials: without an injected
-		// <user>/<password> in remote_servers, every cross-node query
-		// authenticates as the passwordless default against nodes
-		// whose default REQUIRES a password (Code 516 on every
-		// clusterAllReplicas — the live chinit-cutover finding; the
-		// bash era passed -remote-user/-remote-password-file).
-		if pw, err := os.ReadFile(filepath.Join(BootstrapDir, "default-password")); err == nil {
-			request.RemoteUser = "default"
-			request.RemotePassword = strings.TrimSpace(string(pw))
-		}
+	// The inventory host list renders remote_servers; writers, readers
+	// AND the backup replica are CR members — the backup materializes
+	// the same replicated tables, so its remote_servers render needs
+	// the live host inventory like any server node. WITHOUT the map
+	// the render falls back to the CR's POD-pattern host names
+	// (chi-<chi>-<cluster>-<shard>-<replica>) and the server
+	// crash-loops at startup on DNS_ERROR Code 198 for every
+	// unresolvable slot (the 2026-11-16 backup-0 finding: restart
+	// counter 67 on exactly this render). The list is built ONCE
+	// here (live-claims discovery is a lease-table scan; the replica
+	// map and remote_servers must never disagree by racing two scans).
+	request.Replicas = map[string]string{}
+	hosts, note := b.clusterHostsWithSource()
+	if note != "" {
+		slog.Warn(note)
+		fmt.Fprintln(os.Stderr, note)
+	}
+	request.Hosts = hosts
+	// Replica names (the {replica} macro value): without this map
+	// the macros render the operator's POD pattern
+	// (chi-<chi>-<cluster>-<shard>-<replica>) as the replica
+	// identity — the keeper replica_path then registers under a
+	// name no cloud tooling recognizes, and SYSTEM SYNC REPLICA
+	// / DROP REPLICA operate on the wrong identity (the live
+	// chinit-cutover finding). The bash era passed -replica
+	// 01-$idx=$hostname.
+	for _, h := range hosts {
+		request.Replicas[h.Name] = strings.SplitN(h.Address, ".", 2)[0]
+	}
+	// Distributed-query credentials: without an injected
+	// <user>/<password> in remote_servers, every cross-node query
+	// authenticates as the passwordless default against nodes
+	// whose default REQUIRES a password (Code 516 on every
+	// clusterAllReplicas — the live chinit-cutover finding; the
+	// bash era passed -remote-user/-remote-password-file).
+	if pw, err := os.ReadFile(filepath.Join(BootstrapDir, "default-password")); err == nil {
+		request.RemoteUser = "default"
+		request.RemotePassword = strings.TrimSpace(string(pw))
 	}
 	result, err := renderer.RenderNode(ctx, request)
 	if err != nil {
@@ -671,11 +674,48 @@ func ddlReplicaIdentity(stmt, hostname string) (path, replica string) {
 		return "", ""
 	}
 	path = strings.Trim(strings.TrimSpace(parts[0]), "'\"")
+	// The DDL's engine args carry CLICKHOUSE macros — the server
+	// substitutes them at statement time, but the SYSTEM DROP REPLICA
+	// this identity feeds takes a LITERAL path: an unresolved
+	// {shard} reaches the server as "/clickhouse/tables/{shard}/..."
+	// and fails Code 305 "does not look like a table path" (the
+	// 2026-11-16 reader-0 finding: the stale-znode drop silently
+	// no-op'd on every {shard}-macro CREATE, leaving the Code 253
+	// conflict unhealed). Substitute from the node's rendered macros
+	// config — the same file the server itself substitutes from.
+	path = strings.ReplaceAll(path, "{shard}", shardMacroValue())
 	replica = strings.Trim(strings.TrimSpace(parts[1]), "'\"")
 	if replica == "{replica}" {
 		replica = hostname
 	}
 	return path, replica
+}
+
+// shardMacroPath is the macros-config seam (tests redirect).
+var shardMacroPath = func() string {
+	return filepath.Join(ConfigDir, "chop-generated-macros.xml")
+}
+
+// shardMacroValue reads the node's <shard> macro from the rendered
+// macros config. Empty when the file or element is absent — the
+// {shard} substitution then leaves the macro untouched (the drop
+// fails loudly at Code 305, not silently on a wrong path).
+func shardMacroValue() string {
+	data, err := os.ReadFile(shardMacroPath())
+	if err != nil {
+		return ""
+	}
+	// Minimal XML walk — the rendered macros config is flat and
+	// machine-generated; encoding/xml is heavier than the file needs.
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if v := strings.TrimPrefix(line, "<shard>"); v != line {
+			if v = strings.TrimSuffix(v, "</shard>"); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 // splitSQLStatements splits a DDL file into statements on top-level

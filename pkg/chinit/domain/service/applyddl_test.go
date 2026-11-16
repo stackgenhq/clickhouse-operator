@@ -115,6 +115,36 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 		Expect(queries).To(ContainElement(stmt))
 	})
 
+	It("substitutes the {shard} macro in the stale-znode drop path", func() {
+		// The 2026-11-16 finding: the bundle DDL's engine args carry
+		// CLICKHOUSE macros; SYSTEM DROP REPLICA takes a LITERAL path,
+		// so an unresolved {shard} failed Code 305 and the Code 253
+		// conflict stayed unhealed on every {shard}-macro CREATE.
+		macros := filepath.Join(dir, "chop-generated-macros.xml")
+		Expect(os.WriteFile(macros, []byte("<yandex>\n  <macros>\n    <shard>01</shard>\n  </macros>\n</yandex>\n"), 0644)).To(Succeed())
+		smp := shardMacroPath
+		shardMacroPath = func() string { return macros }
+		DeferCleanup(func() { shardMacroPath = smp })
+
+		Expect(os.WriteFile(bootstrapDDLPath(), []byte(
+			"CREATE TABLE IF NOT EXISTS events (id String) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/events', '{replica}');\n"), 0644)).To(Succeed())
+
+		const stmt = "CREATE TABLE IF NOT EXISTS events (id String) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/events', '{replica}')"
+		failOnce := true
+		execClientFn = func(_ context.Context, _, query string) (string, error) {
+			queries = append(queries, query)
+			if query == stmt && failOnce {
+				failOnce = false
+				return "Code: 253", &errString{"Code: 253"}
+			}
+			return "", nil
+		}
+		result, err := ApplyBootstrapDDL(context.Background(), "reader-0")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Created).To(Equal(1))
+		Expect(queries).To(ContainElement("SYSTEM DROP REPLICA 'reader-0' FROM ZKPATH '/clickhouse/tables/01/events'"))
+	})
+
 	It("no-ops loudly when the bundle carries no DDL (pre-0.2.14 AMI)", func() {
 		Expect(os.Remove(filepath.Join(dir, "bootstrap-ddl.sql"))).To(Succeed())
 		result, err := ApplyBootstrapDDL(context.Background(), "writer-0")
