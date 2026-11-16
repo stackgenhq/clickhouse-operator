@@ -585,6 +585,17 @@ func runReplicaSync(args []string) error {
 // node booting mid-churn legitimately saw zero live claims; the
 // renewal is the 5-minute convergence point for short names the
 // replication queue fetches parts by).
+//
+// STATIC ROLES (backup): the lease extension is skipped — a backup
+// node holds no lease row — but the hosts convergence RUNS anyway.
+// The 2026-11-16 finding: backup-0's /etc/hosts carried ZERO cluster
+// entries all day (the boot step wrote none because the static role
+// lists no claims of its own and lease-renew exited fatally at the
+// lease gate before reaching the convergence), so its 19K-entry
+// replication queue DNS-failed every bare-name GET_PART until a
+// human hand-wrote the entries. A backup node fetches parts from
+// writers/readers exactly like a reader does; it needs the same
+// short-name resolution, derived from the same live-claims listing.
 func runLeaseRenew(args []string) error {
 	statePath, err := statePathFlag(args)
 	if err != nil {
@@ -594,8 +605,13 @@ func runLeaseRenew(args []string) error {
 	if err != nil {
 		return err
 	}
-	if st.Identity.LeaseTable == "" {
+	if st.Identity.LeaseTable == "" && st.Identity.Role != model.RoleBackup {
 		return fail.Fatal(fmt.Errorf("node holds no lease (identity has no lease table)"))
+	}
+	if st.Identity.LeaseTable == "" {
+		// Backup: no lease to renew — run the peer convergences only
+		// (the writer/reader claim listing still answers them).
+		return convergeStaticNodePeers(args, st)
 	}
 	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
 	if err != nil {
@@ -716,7 +732,7 @@ func runLeaseRenew(args []string) error {
 					Provider: provider,
 					Meta: port.InstanceMetadata{
 						Provider:   provider.Name(),
-						Region:    st.Identity.Region,
+						Region:     st.Identity.Region,
 						InstanceID: st.Identity.InstanceID,
 						PrivateIP:  st.Identity.PrivateIP,
 					},
@@ -731,6 +747,45 @@ func runLeaseRenew(args []string) error {
 				slog.Warn("lease-renew: spec unreadable; remote-servers convergence skipped", "err", err)
 			}
 		}
+	}
+	return nil
+}
+
+// convergeStaticNodePeers runs the peer convergences for a lease-less
+// role (backup): hosts + DNS, never the lease extension. The lease
+// TABLE name comes from the inventory spec (the boot persisted no
+// LeaseTable on a static identity), so the claims listing the hosts
+// convergence reads is derived from the bundle — the same table name
+// every lease-mode boot read. Best-effort per convergence (the timer
+// retries in 5 minutes).
+func convergeStaticNodePeers(args []string, st *nodeState) error {
+	spec, err := loadInventorySpec()
+	if err != nil || spec == nil {
+		slog.Warn("lease-renew: spec unreadable — static peer convergence skipped", "err", err)
+		return nil
+	}
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
+	if err != nil {
+		return err
+	}
+
+	hostsArgs := service.ConvergeHostsArgs{
+		LeaseTable:   spec.ClaimerTableName,
+		WriterPrefix: spec.writerPrefix(),
+		ReaderPrefix: spec.readerPrefix(),
+		DNSZoneName:  spec.DNSZoneName,
+	}
+	if err := service.ConvergePeerHosts(context.Background(), provider, hostsArgs); err != nil {
+		slog.Warn("lease-renew: peer-hosts convergence failed", "err", err)
+	}
+	dnsArgs := service.ConvergeDNSArgs{
+		LeaseTable:  spec.ClaimerTableName,
+		DNSZoneName: spec.DNSZoneName,
+		Hostname:    st.Identity.Hostname,
+		PrivateIP:   st.Identity.PrivateIP,
+	}
+	if err := service.ConvergePeerDNS(context.Background(), provider, dnsArgs); err != nil {
+		slog.Warn("lease-renew: peer-dns convergence failed", "err", err)
 	}
 	return nil
 }
