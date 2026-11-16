@@ -96,9 +96,17 @@ func (b *Boot) ConvergeRemoteServers(ctx context.Context) error {
 	// system.clusters reflects a config.d file change after RELOAD
 	// CONFIG — no restart). Best-effort; a failure leaves the file in
 	// place and the server picks it up on its own next reload/restart.
-	if out, err := runCommand(ctx, "clickhouse-client", "--query", "SYSTEM RELOAD CONFIG"); err != nil {
+	// execClient authenticates as admin via ENV (the bare client falls
+	// back to the passwordless `default`, whose readonly profile
+	// refuses SYSTEM RELOAD — the live 0.2.27 first-tick finding:
+	// Code 516 AUTHENTICATION_FAILED on every convergence reload).
+	pw := ""
+	if data, err := os.ReadFile(filepath.Join(remoteServersBootstrapDir(), "admin-password")); err == nil {
+		pw = strings.TrimSpace(string(data))
+	}
+	if _, err := execClient(ctx, pw, "SYSTEM RELOAD CONFIG"); err != nil {
 		slog.Warn("remote-servers: reload failed (the file is installed; the server reloads it on restart)",
-			"err", err, "out", strings.TrimSpace(out))
+			"err", err)
 	}
 	return nil
 }
