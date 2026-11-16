@@ -55,7 +55,124 @@ func ValidateXML(path string) error {
 			return chinitsvc.Fatal(fmt.Errorf("XML validation failed for %s: %w", path, err))
 		}
 	}
+	if err := ValidateConfigSemantics(path, data); err != nil {
+		return err
+	}
 	return nil
+}
+
+// userLevelSettingsAtTopLevel are the settings ClickHouse 26.x REJECTS
+// at the top level of a server config fragment (Code 137
+// UNKNOWN_ELEMENT_IN_CONFIG — "user-level setting that should be
+// located in users.xml inside <profiles>"). The 2026-11-16 backup-0
+// crash-loop round one: backup-replica-settings.xml carried
+// <max_threads> at the top and the server crash-looped (restart 67)
+// until the template was fixed. chinit now refuses to install the
+// class — the bundle gate catches it at boot instead of the server
+// dying in a restart loop.
+var userLevelSettingsAtTopLevel = map[string]bool{
+	"max_threads":            true,
+	"max_concurrent_queries": true, // server-level COUNTERPART exists; the bare setting name is user-level at top level
+	"max_memory_usage":       true,
+	"max_execution_time":     true,
+	"max_insert_block_size":  true,
+	"readonly":               true,
+	"profile":                true,
+}
+
+// serverLevelSettings are SERVER settings that merely LOOK like merge
+// tuning (the background pool family). Inside <merge_tree> ClickHouse
+// 26.x rejects them with Code 115 UNKNOWN_SETTING — the 2026-11-16
+// backup-0 crash-loop round two shipped exactly this shape (pool
+// sizes inside <merge_tree>) and the server restart-looped until the
+// template was fixed. At the fragment TOP level they are legal; chinit
+// rejects only the misplaced-inside-merge_tree form.
+var serverLevelSettings = map[string]bool{
+	"background_pool_size":                          true,
+	"background_merges_mutations_concurrency_ratio": true,
+	"background_move_pool_size":                     true,
+	"background_fetches_pool_size":                  true,
+	"background_schedule_pool_size":                 true,
+}
+
+// mergeTreeScopedSettings live in <merge_tree> ONLY. At the top level
+// of a config.d fragment 26.x rejects them (Code 115 UNKNOWN_SETTING).
+var mergeTreeScopedSettings = map[string]bool{
+	"always_fetch_merged_part":                                            true,
+	"replicated_can_become_leader":                                        true,
+	"number_of_free_entries_in_pool_to_lower_max_size_of_merge":           true,
+	"number_of_free_entries_in_pool_to_execute_mutation":                  true,
+	"number_of_free_entries_in_pool_to_execute_optimize_entire_partition": true,
+}
+
+// ValidateConfigSemantics walks one config fragment's element tree and
+// rejects the settings-placement patterns that crash ClickHouse at
+// STARTUP — the three fatal classes the 2026-11-16 convergence audit
+// found in shipped config templates (Code 137 user-level settings at
+// top level; Code 115 merge_tree-scoped settings outside
+// <merge_tree>). The server's own startup check is the last line of
+// defense; this is the first — a broken template fails the boot's
+// install step ONCE with a pointed error instead of a crash loop.
+func ValidateConfigSemantics(path string, data []byte) error {
+	var root xmlNode
+	if err := xml.Unmarshal(data, &root); err != nil {
+		// Token-valid but structurally unmarshalable (mixed content
+		// etc.) — not this validator's class; ValidateXML's walk
+		// already passed it.
+		return nil
+	}
+	// Fragment roots vary (<clickhouse>, <yandex>) — validate the
+	// element's CHILDREN whatever the root name is.
+	return validateNodeChildren(path, &root)
+}
+
+// xmlNode is a generic element: the fragment tree walk needs names
+// and nesting only, never attributes or text.
+type xmlNode struct {
+	XMLName  xml.Name
+	Children []xmlNode `xml:",any"`
+}
+
+func validateNodeChildren(path string, node *xmlNode) error {
+	inMergeTree := node.XMLName.Local == "merge_tree"
+	for _, child := range node.Children {
+		name := child.XMLName.Local
+		// User-level settings belong in users.d (<profiles>), never
+		// in a server config fragment (Code 137 at startup).
+		if userLevelSettingsAtTopLevel[name] && !inProfileTree(node) {
+			return chinitsvc.Fatal(fmt.Errorf(
+				"%s: <%s> is a user-level setting in a server config fragment — "+
+					"ClickHouse 26.x refuses to start with Code 137 UNKNOWN_ELEMENT_IN_CONFIG "+
+					"(move it to the spec's profiles: section; it renders into users.d)",
+				path, name))
+		}
+		// Server-level pool settings INSIDE <merge_tree>: the
+		// backup-0 round-two shape — Code 115 at startup.
+		if serverLevelSettings[name] && inMergeTree {
+			return chinitsvc.Fatal(fmt.Errorf(
+				"%s: <%s> is a SERVER-level setting — inside <merge_tree> ClickHouse 26.x "+
+					"refuses to start with Code 115 UNKNOWN_SETTING (move it to the fragment top level)",
+				path, name))
+		}
+		// Merge-tree-scoped settings at the fragment top level: the
+		// mirror error — Code 115 the other way.
+		if mergeTreeScopedSettings[name] && !inMergeTree && !inProfileTree(node) {
+			return chinitsvc.Fatal(fmt.Errorf(
+				"%s: <%s> belongs inside <merge_tree> — at the fragment top level "+
+					"ClickHouse 26.x refuses to start with Code 115 UNKNOWN_SETTING",
+				path, name))
+		}
+		if err := validateNodeChildren(path, &child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// inProfileTree reports whether node is a profiles subtree (users.d
+// renders carry these; a setting inside <profiles>/<default> is legal).
+func inProfileTree(node *xmlNode) bool {
+	return node.XMLName.Local == "profiles" || node.XMLName.Local == "default" || node.XMLName.Local == "readonly"
 }
 
 // StaticConfigInstaller moves the downloaded bundle's static XMLs into
