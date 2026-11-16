@@ -16,12 +16,14 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
@@ -131,6 +133,18 @@ func (g *VolumeGrower) GrowVolume(ctx context.Context, volumeID string, targetSi
 		Size:     aws.Int32(targetSizeGB),
 	})
 	if err != nil {
+		// IncorrectModificationState (volume OPTIMIZING) is the
+		// normal back-to-back-grow race: a prior modification is
+		// still settling and AWS rejects a new one. The caller's
+		// 5-minute timer retries — the error must not read as a
+		// grower outage (the 2026-11-16 reader-0 finding: the job
+		// aborted at 2.42 GiB free because a prior grow was
+		// OPTIMIZING).
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "IncorrectModificationState" {
+			return false, fmt.Errorf("modify volume %s to %d: previous modification still in flight (%s); next timer tick retries: %w",
+				volumeID, targetSizeGB, apiErr.ErrorMessage(), err)
+		}
 		return false, fmt.Errorf("modify volume %s to %d: %w", volumeID, targetSizeGB, err)
 	}
 	return true, nil
