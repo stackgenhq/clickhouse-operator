@@ -551,7 +551,7 @@ func runSchemaBootstrap(args []string) error {
 		return err
 	}
 	ctx := context.Background()
-	result, err := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname)
+	result, err := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname, string(st.Identity.Role))
 	if err != nil {
 		return fmt.Errorf("schema bootstrap failed (retry on timer): %w", err)
 	}
