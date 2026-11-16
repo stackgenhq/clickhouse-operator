@@ -25,9 +25,9 @@ state consistent. The problems chinit is built to solve:
 | Node configuration has to differ per instance (identity, IPs, role) while staying identical in logic — templating config into per-node variants drifts and is untestable | `chinit.yaml` — a typed, validated spec fetched (SHA256-gated) from object storage; the binary is identical across roles and clouds, only the spec is per-role |
 | Cloud APIs are flaky and every failure needs a deliberate answer (retry? abort? degrade loudly?) — ad-hoc retries either mask bugs or wedge boots | A retry engine: Retryable/Fatal error classification, exponential backoff with jitter, per-step deadlines, Critical/BestEffort criticality |
 | A boot that crashes halfway and re-runs from scratch is slow and unsafe (re-claiming identity mid-flight can renumber a live cluster member) | Convergence: every step probes real system state first; `state.json` records done steps and resumes; a new bundle hash invalidates and re-renders |
-| Post-boot maintenance (schema sync, replica sync, lease renewal, keeper health, GCs, backups, spot handling, graceful shutdown) needs to run on schedule, on the right node, with the right identity | Subcommands: `chinit schema-sync`, `replica-sync`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown` — units are one ExecStart line, all logic testable Go |
+| Post-boot maintenance (schema bootstrap, schema sync, replica sync, lease renewal, keeper health, GCs, backups, spot handling, graceful shutdown) needs to run on schedule, on the right node, with the right identity | Subcommands: `chinit schema-bootstrap`, `schema-sync`, `replica-sync`, `lease-renew`, `keeper-health`, `dead-replica-gc`, `orphaned-gc`, `backup-daily`, `spot-watch`, `drain-shutdown` — units are one ExecStart line, all logic testable Go |
 | A terminating instance must release its identity (ordinal lease, DNS record, replica registration) — but an ASG scale-in's SSM dispatch races the agent's own teardown, and an EC2 health-check termination never fires the hook at all | `chinit-shutdown-drain.service` (v0.2.15): ExecStop runs `chinit drain-shutdown` inside systemd's shutdown transaction, ordered `After=clickhouse-server` — the ONE path every termination mode goes through, with a reboot guard (`reboot.target` → skip: identity survives a reboot) |
-| A dead node's DNS record keeps answering its IP until the lease TTL (15 min) or a human notices — every cluster fan-out resolves the dead name and stalls | The `lease-renew` tick converges the private zone (`ConvergePeerDNS`, v0.2.14): self-record upsert + expired-slot record sweep — residue heals within one 5-minute tick |
+| A dead node's residue outlives it: the DNS record keeps answering a dead IP until the lease TTL (15 min), and the rendered `remote_servers` keeps naming the dead peer until the next re-render — every cluster fan-out resolves or retries the dead name and stalls | The `lease-renew` tick converges all three layers from the live claims: `/etc/hosts` (v0.2.7), the private zone (`ConvergePeerDNS`, v0.2.14: self-upsert + expired-slot sweep), and the rendered `remote_servers` (`ConvergeRemoteServers`, v0.2.27/0.2.28: drift-only install + admin-authenticated hot reload) — residue heals within one 5-minute tick |
 | Cloud CLI calls with hand-built JSON are fragile and per-cloud ports don't compose | Provider adapters over the SDKs: Secrets Manager/Key Vault, DynamoDB/Table Storage ordinal leases, Route53/Private DNS, S3/Blob bundle fetch, IMDSv2 |
 | Nothing testable — a boot change means a live-fleet experiment | Unit tests per package + a **provider conformance suite**: one contract, run per cloud against fake IMDS/canned secrets/canned bundle |
 | A new cloud means a rewrite | One `infra/azure` package implementing the same ports; GCP/Civo are one package + one registry line each |
@@ -57,19 +57,24 @@ DNS) still boots — the pipeline degrades loudly instead of failing.
 
 ## The boot
 
-`chinit boot` runs 22 convergent steps in a load-bearing order (identity
+`chinit boot` runs 23 convergent steps in a load-bearing order (identity
 settles **before** renders — the "ip-10-0-1-101 never joined the cluster"
 production finding; passwords land **before** the render; keepers skip the
 server start; the health gate is non-fatal so a reader booting while a peer
 is down still joins):
 
 ```
-fetch_config_bundle → os_optimizations → require_binaries → mount_data_disks
-→ install_static_configs → settle_identity → retrieve_passwords
-→ render_node_config (in-process library — no process boundary)
-→ configure_keeper → write_node_env → start_clickhouse → health_gate
-→ prometheus_reload → install_units → configure_backup → configure_monitoring
-→ install_spot_watch → install_shutdown_drain → boot_finished
+PHASE 1 (parallel — errgroup):
+  fetch_config_bundle ∥ os_optimizations ∥ require_binaries
+  ∥ mount_data_disks ∥ settle_identity ∥ retrieve_passwords ∥ configure_tls
+
+PHASE 2 (serial — each reads what phase 1 wrote):
+  install_static_configs → configure_peer_hosts → configure_server_env
+  → render_node_config (in-process library — no process boundary)
+  → configure_keeper → write_node_env → start_clickhouse
+  → bootstrap_schema → health_gate → prometheus_reload → install_units
+  → configure_backup → configure_monitoring → configure_cloudwatch
+  → install_spot_watch → install_shutdown_drain → boot_finished
 ```
 
 The settled identity (hostname, CR name, lease, DNS zone) is persisted to

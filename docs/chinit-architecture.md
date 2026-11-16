@@ -120,14 +120,15 @@ adding a child requires proving that disjointness, not assuming it.
 | 12 | `configure_keeper` | Critical | onceFatal | keeper nodes: single-file render + myid/raft-id discipline + service enable; no-ops for others — a keeper joining with a stale --config disrupts the raft ensemble itself (the role gate keeps every non-keeper boot unaffected) |
 | 13 | `write_node_env` | BestEffort | onceFatal | the shell-contract file for anything not yet on typed state |
 | 14 | `start_clickhouse` | Critical | onceFatal | enable, start, wait for `/ping`, S3-disk health probe; keepers return immediately |
-| 15 | `health_gate` | BestEffort | onceFatal | the in-process health fan-out with the CR inventory; non-fatal BY DESIGN so a reader booting while a peer is down still joins |
-| 16 | `prometheus_reload` | BestEffort | bootWait | reload + wait for the metrics endpoint; restart fallback |
-| 17 | `install_units` | Critical | onceFatal | the recurring-job units (below): lease-renew keeps the ordinal claim alive (an expired claim is identity theft — another instance claims the same ordinal), schema-sync materializes the node's tables, disk-autoscale is the merge-stall early warning |
-| 18 | `configure_backup` | Critical | onceFatal | clickhouse-backup config + daily timer — no-ops cleanly when backups are not configured; when the operator EXPLICITLY pinned a bucket, a silent no-backup node is a restore-time data-loss discovery |
-| 19 | `configure_monitoring` | BestEffort | onceFatal | OTEL/Fluent Bit shipping; silently disabled when the endpoint is empty |
-| 20 | `install_spot_watch` | BestEffort | onceFatal | readers on spot-capable clouds: the drain daemon |
-| 21 | `install_shutdown_drain` | Critical | onceFatal | writers + readers: the in-node shutdown drain unit (below) — a node without it terminates cold and leaks the stale-DNS/lease residue |
-| 22 | `boot_finished` | Critical | onceFatal | the final timing summary |
+| 15 | `bootstrap_schema` | BestEffort | apiRetry | **[phase 2]** the bundle's DDL applied per-node (every CREATE is IF NOT EXISTS with {shard}/{replica} macros): a node that already has its tables is a no-op; a FULLY-CHURNED fleet re-materializes its own schema at boot (the finding: when every peer churns within one refresh, no node holds the schema for schema-sync to propagate from, and the fleet stays schemaless until a manual DDL session). Retried by the schema-bootstrap timer until a pass is clean |
+| 16 | `health_gate` | BestEffort | onceFatal | the in-process health fan-out with the CR inventory; non-fatal BY DESIGN so a reader booting while a peer is down still joins |
+| 17 | `prometheus_reload` | BestEffort | bootWait | reload + wait for the metrics endpoint; restart fallback |
+| 18 | `install_units` | Critical | onceFatal | the recurring-job units (below): lease-renew keeps the ordinal claim alive (an expired claim is identity theft — another instance claims the same ordinal), schema-sync materializes the node's tables, disk-autoscale is the merge-stall early warning |
+| 19 | `configure_backup` | Critical | onceFatal | clickhouse-backup config + daily timer — no-ops cleanly when backups are not configured; when the operator EXPLICITLY pinned a bucket, a silent no-backup node is a restore-time data-loss discovery |
+| 20 | `configure_monitoring` | BestEffort | onceFatal | OTEL/Fluent Bit shipping; silently disabled when the endpoint is empty |
+| 21 | `install_spot_watch` | BestEffort | onceFatal | readers on spot-capable clouds: the drain daemon |
+| 22 | `install_shutdown_drain` | Critical | onceFatal | writers + readers: the in-node shutdown drain unit (below) — a node without it terminates cold and leaks the stale-DNS/lease residue |
+| 23 | `boot_finished` | Critical | onceFatal | the final timing summary |
 
 **The criticality question, stated once**: Critical means "a node
 that boots WITHOUT this step is a liability as a cluster member" — it
@@ -235,8 +236,16 @@ operator's machinery uses (`CRName()` in `boot.go`). The CR layout
 names its single shard `01` (never an anonymous zero index — that
 re-keys every table's Keeper path), so CR hosts are `01-0..01-(N-1)`
 over the full server fleet: writers take `01-0..`, readers continue at
-`01-(writer_count + ordinal)..`. Keepers and the backup replica are
-not CR members — empty CR name is the signal every consumer keys on.
+`01-(writer_count + ordinal)..`, and the **backup replica is a CR
+member** (v0.2.26) at the FIRST slot after the readers' ceiling —
+`01-(writer_max + reader_max)`, the +1 the Terraform render folds
+into `replicasCount`. The backup materializes the same replicated
+tables (it is a part-fetch peer despite holding no lease), so its
+render needs the host-group sections like any server node: an empty
+CRName meant the host-group render never ran on it (no macros file —
+Code 139 on `{replica}` paths; no zookeeper section — Code 225;
+remote_servers listing VACANT slots — Code 198). Keepers remain
+non-CR — the empty CR name is the signal every consumer keys on.
 
 The settled identity persists **immediately** at claim time
 (`PersistIdentity`), before renders and the server start: a crash
@@ -264,7 +273,18 @@ BootSpec ──► LoadCHI/LoadCHK ──► NodeRenderer.RenderNode(...)
 Why each map exists (every one is a live finding):
 
 - `Hosts` keyed by CR name — key by hostname and `remote_servers`
-  renders the operator's unresolvable pod-DNS pattern.
+  renders the operator's unresolvable pod-DNS pattern. The inventory
+  includes the backup replica (v0.2.26: it is a CR member and a
+  part-fetch peer despite holding no lease).
+- `{shard}` macro substitution in the spec's DDL fragments — the
+  bundle's CREATE statements carry `{shard}`/`{replica}` macros that
+  the per-node bootstrap substitutes BEFORE execution (v0.2.26:
+  an unsubstituted `{shard}` in a Keeper path re-keyed every table).
+- Config-fragment discipline (v0.2.30): user-level settings at the
+  TOP level of a server config fragment are REFUSED at load
+  (ClickHouse 26.x Code 137 UNKNOWN_ELEMENT_IN_CONFIG) — the loader
+  rejects the spec with the offending key named, instead of letting
+  the server crash-loop on a fragment that parses but cannot apply.
 - `Replicas` — without it the `{replica}` macro renders the pod
   pattern; the table registers under a Keeper path no cloud tooling
   recognizes and `SYSTEM SYNC/DROP REPLICA` operate on the wrong
@@ -297,11 +317,12 @@ Units are one `ExecStart` line — logic lives in testable Go:
 
 | Unit (service/timer) | ExecStart | Roles | Cadence |
 |---|---|---|---|
+| `schema-bootstrap` | `chinit schema-bootstrap` | writer, reader, backup | every 15 min — idempotent re-apply of the bundle DDL until a pass is clean (the boot's bootstrap can exhaust its retries against a mid-churn peer; the timer is the after-the-boot heal) |
 | `schema-sync` | `chinit schema-sync -retries 3 -prune-stale-self` | writer, reader | hourly |
 | `replica-sync` | `chinit replica-sync` | writer, reader | post-boot |
 | `keeper-health` | `chinit keeper-health` | keeper | timer |
-| `lease-renew` | `chinit lease-renew` | leased nodes (writers + readers) | every 5 min — also converges `/etc/hosts` and the private zone (the DNS self-heal, v0.2.14) |
-| `dead-replica-gc` | `chinit dead-replica-gc` | writers (runs on the ordinal-0 holder) | weekly |
+| `lease-renew` | `chinit lease-renew` | leased nodes (writers + readers), and lease-less CR members (the backup — v0.2.29: DNS-resolved hosts lines) | every 5 min — also converges `/etc/hosts`, the private zone (the DNS self-heal, v0.2.14) and the rendered `remote_servers` (v0.2.27/0.2.28) |
+| `dead-replica-gc` | `chinit dead-replica-gc` | writers (runs on the ordinal-0 holder) | hourly (v0.2.29 — weekly left a dead registration wedging fan-outs for days) |
 | `orphaned-data-gc` | `chinit orphaned-gc` | writers (runs on the ordinal-0 holder) | weekly |
 | `clickhouse-backup-daily` | `chinit backup-daily` | backup replica | daily 02:00 |
 | `chinit-spot-watch` | `chinit spot-watch` | spot readers | daemon |
@@ -323,10 +344,17 @@ node). The dead-replica GC itself is two passes with an asymmetric
 safety posture: the **reader pass always runs** (`reader-*` — readers
 are disposable, their drain already dropped them authoritatively); the
 **writer pass runs only with liveness data** — it lists the lease
-table's active claims first and passes every live writer as an exclude entry on the gc request, so a stale-looking registration whose lease is minutes
-fresh (a mid-boot re-join) is reported but never dropped. No
-lease-listing capability or a scan failure skips the writer pass with
-a warning; the reader pass still ran. the gc request carries the exclude set for exactly this guard.
+table's active claims first and passes every live writer as an exclude
+entry on the gc request, so a stale-looking registration whose lease
+is minutes fresh (a mid-boot re-join) is reported but never dropped.
+No lease-listing capability or a scan failure skips the writer pass
+with a warning; the reader pass still ran. The GC request carries the
+exclude set for exactly this guard.
+
+The cadence is **hourly** (v0.2.29 — weekly left a dead registration
+wedging cluster fan-outs for days after the drain missed it; hourly
+bounds the exposure to the GC's own window while the liveness guard
+keeps a mid-boot re-join safe).
 
 ## The termination story: three triggers, one drain sequence
 
@@ -385,27 +413,44 @@ termination mode the others cannot reach:
 **Failure is CONTINUE, by design** — the same contract as the hook:
 the node is stateless (parts durable in object storage, quorum spans
 the shard), a failed drain logs loudly, and the safety nets (lease
-TTL 15 min, weekly dead-replica GC, the periodic DNS convergence)
+TTL 15 min, hourly dead-replica GC, the periodic convergences)
 clean the residue.
 
-### The periodic DNS convergence (the self-healing net, v0.2.14)
+### The periodic convergences (the self-healing net)
 
-Every `lease-renew` tick (5 min) converges, best-effort:
+Every `lease-renew` tick (5 min) converges three layers of the same
+live-claims inventory, best-effort — the RESOLUTION of peer names and
+the MEMBERSHIP list the fan-outs use:
 
 - **`/etc/hosts`** (`ConvergePeerHosts`, v0.2.7): sweep + rewrite the
   short-name lines from the live claims — replication queues fetch
   parts by bare hostname and systemd-resolved will not answer short
-  names.
-- **The private DNS zone** (`ConvergePeerDNS`): upsert SELF (the
-  settled identity is authoritative for its own record even after an
-  ASG re-IP), then delete every ordinal name whose lease expired —
-  the A record a missed drain leaves points at a dead IP and wedges
-  every cluster fan-out that resolves it.
+  names. Lease-less CR members (the backup) earn their hosts line via
+  DNS resolution (v0.2.29 — the backup claims no ordinal, so the
+  claims list alone never listed it).
+- **The private DNS zone** (`ConvergePeerDNS`, v0.2.14): upsert SELF
+  (the settled identity is authoritative for its own record even
+  after an ASG re-IP), then delete every ordinal name whose lease
+  expired — the A record a missed drain leaves points at a dead IP
+  and wedges every cluster fan-out that resolves it.
+- **The rendered `remote_servers`** (`ConvergeRemoteServers`,
+  v0.2.27/0.2.28): re-render the cluster inventory section from the
+  CURRENT live claims (the same render path the boot uses — the
+  vacant-slot filter, credential injection), install it ONLY when
+  the content drifted (byte-compare against the installed file), and
+  hot-reload — `SYSTEM RELOAD CONFIG` applies `remote_servers` live,
+  authenticated as admin via env credentials (v0.2.28; the bare
+  client falls back to the passwordless `default` whose readonly
+  profile refuses the statement). A scale-in peer's entry leaves the
+  rendered inventory within one tick instead of waiting for the next
+  boot/refresh re-render.
 
-The sweep is race-safe by construction: a replacement claims the
+The DNS sweep is race-safe by construction: a replacement claims the
 ordinal BEFORE it boots (the claim row is live by then), so a record
 whose lease is live is never a delete candidate; an expired lease
-has no holder by definition.
+has no holder by definition. The `remote_servers` convergence can
+never fight the render contract — a converged file is byte-identical
+to what the next boot --refresh would write.
 
 ## The conformance suite: one contract, every cloud
 
@@ -474,6 +519,7 @@ pkg/chinit/domain/
   service/units.go                unit composition per role (incl. the shutdown-drain unit)
   service/hosts.go                the /etc/hosts convergence (lease-renew tick)
   service/peerdns.go              the private-zone convergence (lease-renew tick) + the parting sweep
+  service/peerrservers.go         the remote_servers convergence (lease-renew tick, v0.2.27+)
   service/conformance/            the provider contract suite
   fail/                           Retryable/Fatal classification
 pkg/chinit/infra/
