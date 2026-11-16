@@ -422,11 +422,11 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 		if out, rerr := runCommand(ctx, "systemctl", "restart", "clickhouse-keeper"); rerr != nil {
 			return fmt.Errorf("restart clickhouse-keeper after config refresh: %w: %s", rerr, out)
 		}
-		return nil
-	}
-	out, err = runCommand(ctx, "systemctl", "enable", "--now", "clickhouse-keeper")
-	if err != nil {
-		return fmt.Errorf("enable clickhouse-keeper: %w: %s", err, out)
+	} else {
+		out, err = runCommand(ctx, "systemctl", "enable", "--now", "clickhouse-keeper")
+		if err != nil {
+			return fmt.Errorf("enable clickhouse-keeper: %w: %s", err, out)
+		}
 	}
 	// clickhouse-server must NOT run on a keeper: keepers skip
 	// render_node_config by design (configure_keeper owns the keeper
@@ -435,8 +435,11 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 	// the unit anyway (the live 2026-11-16 finding: keeper-0 ran a
 	// clickhouse-server answering AUTHENTICATION_FAILED for every
 	// spec user — the "empty users.d" reports were the SERVER running
-	// where it never should have). Disable + stop converges the drift
-	// on both first boot and refresh.
+	// where it never should have). Runs on BOTH branches — first
+	// boot AND refresh: a pre-0.2.23 keeper that upgrades via
+	// in-place refresh keeps its stray server until this converges
+	// it (the 2026-11-16 roll finding: the refresh branch returned
+	// early and the keeper's server kept answering stock users).
 	if out, derr := runCommand(ctx, "systemctl", "disable", "--now", "clickhouse-server"); derr != nil {
 		return fmt.Errorf("disable clickhouse-server on keeper: %w: %s", derr, out)
 	}
