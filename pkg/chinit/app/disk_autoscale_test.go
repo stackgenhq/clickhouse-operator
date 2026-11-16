@@ -17,9 +17,9 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -187,8 +187,10 @@ var _ = Describe("runDiskAutoscale", func() {
 		runCommandWithEnv = func(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 			probedArgs = append(probedArgs, args)
 			probedEnv = append(probedEnv, env)
-			// The free-space probe: return the seeded bytes.
-			return []byte(strconv.FormatInt(int64(freeGB*(1<<30)), 10)), nil
+			// The disks probe: <unreserved> <keep_free> — the seeded
+			// GiB as unreserved, storage.xml's 10 GiB reservation as
+			// keep_free (the production storage.xml shape).
+			return []byte(fmt.Sprintf("%d %d", int64(freeGB*(1<<30)), int64(10*(1<<30)))), nil
 		}
 		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return fakes.provider, nil
@@ -201,7 +203,7 @@ var _ = Describe("runDiskAutoscale", func() {
 	}
 
 	It("is a no-op above the floor", func() {
-		seed(40) // 40 GiB effective > 8 GiB floor
+		seed(40) // 40 GiB unreserved > derived floor (keep_free 10 + headroom 2 = 12 GiB)
 		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
 		Expect(fakes.grower.grew).To(BeEmpty())
 		Expect(fakes.grower.described).To(BeEmpty())
@@ -224,7 +226,7 @@ var _ = Describe("runDiskAutoscale", func() {
 	})
 
 	It("grows the volume and resizes the filesystem below the floor", func() {
-		seed(2) // 2 GiB effective < 8 GiB floor: must grow by 32 to 64
+		seed(2) // 2 GiB unreserved < derived floor (12 GiB): must grow by 32 to 64
 		Expect(runDiskAutoscale([]string{"-state", statePath})).To(Succeed())
 		Expect(fakes.grower.described).To(HaveLen(1))
 		Expect(fakes.grower.described[0].InstanceID).To(Equal("i-0cf1cda168d841a50"))

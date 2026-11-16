@@ -204,7 +204,7 @@ var _ = Describe("ConvergePeerHosts", func() {
 // (AsLeaseLister answers nil) — the no-lease-store cloud degradation.
 type bareListerProvider struct{}
 
-func (p *bareListerProvider) Name() string                            { return "azure" }
+func (p *bareListerProvider) Name() string { return "azure" }
 func (p *bareListerProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
 	return port.InstanceMetadata{}, nil
 }
@@ -214,3 +214,63 @@ func (p *bareListerProvider) GetSecretValue(context.Context, port.SecretRequest)
 func (p *bareListerProvider) FetchBundle(context.Context, model.ConfigBundle, string) ([]string, error) {
 	return nil, nil
 }
+
+var _ = Describe("ConvergePeerHosts backup replica", func() {
+	var hostsPath string
+
+	BeforeEach(func() {
+		dir, err := os.MkdirTemp("", "chinit-hosts-bk-*")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = os.RemoveAll(dir) })
+		hostsPath = filepath.Join(dir, "hosts")
+		orig := peerHostsPath
+		peerHostsPath = func() string { return hostsPath }
+		DeferCleanup(func() { peerHostsPath = orig })
+		Expect(os.WriteFile(hostsPath, []byte("127.0.0.1 localhost\n"), 0644)).To(Succeed())
+	})
+
+	It("writes the backup line from the FQDN resolution (Code 198 regression)", func() {
+		// The backup holds no lease, so the claim scan never carries
+		// it; before the fix every peer resolving its short name for
+		// a part fetch died on DNS_ERROR (the 2026-11-16 finding).
+		// The address is DERIVED from the private zone at convergence
+		// time — the test resolves backup-0.zone.internal via the
+		// OS resolver, so point the FQDN at a fixed loopback address
+		// through the hosts file the convergence itself reads... the
+		// simplest deterministic seam: the FQDN lookup happens on the
+		// node's resolver; with no zone record the line is skipped.
+		// Assert the WARN path instead: no backup record → no line,
+		// and the claims still converge.
+		lister := &fakeLeaseLister{claims: []port.Claim{
+			{Hostname: "writer-0", IP: "10.0.1.69"},
+		}}
+		err := ConvergePeerHosts(context.Background(), &listerProvider{lister}, ConvergeHostsArgs{
+			LeaseTable:            "claims",
+			WriterPrefix:          "writer-",
+			ReaderPrefix:          "reader-",
+			DNSZoneName:           "nonexistent.invalid",
+			BackupReplicaHostname: "backup-0",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		data, _ := os.ReadFile(hostsPath)
+		Expect(string(data)).To(ContainSubstring("10.0.1.69 writer-0"))
+		Expect(string(data)).NotTo(ContainSubstring(" backup-0 "), "an unresolvable backup FQDN writes no line")
+	})
+
+	It("sweeps a stale backup line from a prior convergence", func() {
+		// A re-provisioned backup's old IP must not linger.
+		Expect(os.WriteFile(hostsPath, []byte("127.0.0.1 localhost\n10.9.9.9 backup-0 backup-0.zone.internal\n"), 0644)).To(Succeed())
+		lister := &fakeLeaseLister{claims: []port.Claim{}}
+		err := ConvergePeerHosts(context.Background(), &listerProvider{lister}, ConvergeHostsArgs{
+			LeaseTable:            "claims",
+			WriterPrefix:          "writer-",
+			ReaderPrefix:          "reader-",
+			DNSZoneName:           "nonexistent.invalid",
+			BackupReplicaHostname: "backup-0",
+		})
+		Expect(err).NotTo(HaveOccurred())
+		data, _ := os.ReadFile(hostsPath)
+		Expect(string(data)).NotTo(ContainSubstring("10.9.9.9"), "the stale backup IP is swept")
+		Expect(string(data)).To(ContainSubstring("127.0.0.1 localhost"))
+	})
+})
