@@ -138,7 +138,12 @@ func (b *Boot) chinitUnits() []system.UnitFile {
 			// work happens on the holder.
 			units = append(units,
 				b.chinitUnit("dead-replica-gc.service", "Dead replica GC (ordinal-0 writer only)", "dead-replica-gc"),
-				chinitTimer("dead-replica-gc.timer", "Run dead-replica GC weekly", "Mon *-*-* 03:00:00"),
+				// dead-replica-gc runs HOURLY (was weekly): a scale-in's shutdown
+				// drain can lose the ASG termination race under load; the 2026-11-16
+				// 1-hour test showed a dead replica's stale registration blocking the
+				// whole fleet's replication queues for hours (GET_PART entries citing
+				// a vanished source; the weekly window would leave them wedged for days).
+				chinitTimer("dead-replica-gc.timer", "Run dead replica GC hourly", "hourly"),
 				b.chinitUnit("orphaned-data-gc.service", "Orphaned S3 parts GC (ordinal-0 writer only)", "orphaned-gc"),
 				chinitTimer("orphaned-data-gc.timer", "Run orphaned S3 parts GC weekly", "Sun *-*-* 04:00:00"),
 			)
@@ -175,8 +180,21 @@ func (b *Boot) installUnits(ctx context.Context) error {
 	return nil
 }
 
+// backupConfigPath and backupConfigDir are the seams configureBackup
+// writes through (tests redirect; production binds the real
+// clickhouse-backup paths — the bootstrapDDLPath pattern).
+var (
+	backupConfigDir  = func() string { return "/etc/clickhouse-backup" }
+	backupConfigPath = func() string { return backupConfigDir() + "/config.yml" }
+)
+
 // configureBackup writes clickhouse-backup's config.yml against the
 // provider object storage and (on the backup replica) the daily timer.
+// backupToolBin is the seam for the clickhouse-backup presence check
+// (tests point it at an existing file; production binds the golden AMI
+// path — the backupConfigDir pattern).
+var backupToolBin = func() string { return "/usr/local/bin/clickhouse-backup" }
+
 func (b *Boot) configureBackup(ctx context.Context) error {
 	if b.Spec.Role == model.RoleKeeper {
 		return nil
@@ -184,11 +202,11 @@ func (b *Boot) configureBackup(ctx context.Context) error {
 	if b.Spec.Backup.Bucket == "" {
 		return nil // backups disabled
 	}
-	if _, err := os.Stat("/usr/local/bin/clickhouse-backup"); err != nil {
+	if _, err := os.Stat(backupToolBin()); err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: clickhouse-backup absent (golden AMI expected it) - backups disabled\n")
 		return nil
 	}
-	if err := os.MkdirAll("/etc/clickhouse-backup", 0755); err != nil {
+	if err := os.MkdirAll(backupConfigDir(), 0755); err != nil {
 		return err
 	}
 	retention := b.Spec.Backup.RetentionDays
@@ -201,9 +219,25 @@ func (b *Boot) configureBackup(ctx context.Context) error {
 	}
 	prefix := strings.Trim(b.Spec.Backup.Prefix, "/") + "/" + b.Spec.ClusterName
 
+	// ClickHouse credentials for the backup tool. The golden AMI ships
+	// clickhouse-backup 2.5.0, which predates the `password_file` config key
+	// (added in v3.0) — a password_file entry is silently ignored and the
+	// tool authenticates with an empty password, failing with code 516.
+	// The `default` user is chctl-restricted (readonly mode rejects the
+	// tool's `connect_timeout` setting), so the admin user is used with
+	// its password rendered inline. Without this, every node boot writes
+	// an unusable config.yml and the nightly backup never lands.
+	adminPw := ""
+	if pw, err := os.ReadFile(BootstrapDir + "/admin-password"); err == nil {
+		adminPw = strings.TrimSpace(string(pw))
+	}
+	if adminPw == "" {
+		return fmt.Errorf("configureBackup: %s/admin-password missing or empty", BootstrapDir)
+	}
+
 	cfg := fmt.Sprintf(`clickhouse:
-  username: default
-  password_file: %s/default-password
+  username: admin
+  password: %s
   host: localhost
   port: 9000
   data_path: /var/lib/clickhouse
@@ -231,9 +265,9 @@ s3:
   # Credentials come from the instance role (SDK chain); leave unset
   compression_level: %d
   compression_format: %s
-`, BootstrapDir, retention, b.Spec.Backup.Bucket, prefix, b.Identity.Region, compressionLevel, b.Spec.Backup.CompressionFormat)
+`, adminPw, retention, b.Spec.Backup.Bucket, prefix, b.Identity.Region, compressionLevel, b.Spec.Backup.CompressionFormat)
 
-	if err := os.WriteFile("/etc/clickhouse-backup/config.yml", []byte(cfg), 0600); err != nil {
+	if err := os.WriteFile(backupConfigPath(), []byte(cfg), 0600); err != nil {
 		return err
 	}
 
