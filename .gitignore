@@ -58,9 +58,3 @@ AGENTS.md
 .claude
 
 /.cr-release-packages
-
-# local build output (cmd/chinit)
-/chinit
-
-# goreleaser local snapshot output
-/dist/
