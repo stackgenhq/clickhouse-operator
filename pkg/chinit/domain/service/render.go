@@ -425,6 +425,18 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("enable clickhouse-keeper: %w: %s", err, out)
 	}
+	// clickhouse-server must NOT run on a keeper: keepers skip
+	// render_node_config by design (configure_keeper owns the keeper
+	// render), so no users.d ever renders and the server would serve
+	// with the package's stock users. The deb's systemd preset enables
+	// the unit anyway (the live 2026-11-16 finding: keeper-0 ran a
+	// clickhouse-server answering AUTHENTICATION_FAILED for every
+	// spec user — the "empty users.d" reports were the SERVER running
+	// where it never should have). Disable + stop converges the drift
+	// on both first boot and refresh.
+	if out, derr := runCommand(ctx, "systemctl", "disable", "--now", "clickhouse-server"); derr != nil {
+		return fmt.Errorf("disable clickhouse-server on keeper: %w: %s", derr, out)
+	}
 	return nil
 }
 
@@ -505,23 +517,68 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 // REPLICA_ALREADY_EXISTS — that must not wedge the boot (the schema-sync
 // unit and the health gate remain the heal paths); the failure is loud
 // in the boot log for triage.
+// bootstrapSchema is the boot step; the convergence body is
+// ApplyBootstrapDDL (the `chinit schema-bootstrap` subcommand runs the
+// same pass on its timer — the 2026-11-16 finding: reader-0 exhausted
+// the boot's 5 apiRetry attempts while the keeper rolled in the same
+// refresh and stayed schemaless for HOURS because nothing retried the
+// bundle DDL after the boot gave up).
 func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	if b.Spec.Role == model.RoleKeeper {
 		return nil // keepers carry no tables
 	}
-	ddlPath := filepath.Join(BootstrapDir, "bootstrap-ddl.sql")
+	result, err := ApplyBootstrapDDL(ctx, b.Identity.Hostname)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("schema bootstrap: %d statement(s) applied from %s (%d failed)\n", result.Created, result.DDLPath, result.Failed)
+	// A retryable error surfaces when anything failed: the statement set
+	// is idempotent (IF NOT EXISTS + the drop-own-znode conflict path),
+	// so a re-run converges instead of wedging. BestEffort classification
+	// still keeps a final-pass failure from killing the boot — the
+	// schema-sync unit and health gate remain the heal paths.
+	if result.Failed > 0 {
+		return fmt.Errorf("schema bootstrap: %d statement(s) failed (retrying; transient keeper races converge on the next pass)", result.Failed)
+	}
+	return nil
+}
+
+// DDLApplyResult reports one convergence pass of the bundle DDL.
+type DDLApplyResult struct {
+	DDLPath string
+	Created int
+	Failed  int
+}
+
+// bootstrapDDLPath and bootstrapAdminPasswordPath are the path seams
+// ApplyBootstrapDDL reads (tests redirect; production binds the
+// bundle's constants — the peerHostsPath pattern).
+var (
+	bootstrapDDLPath          = func() string { return filepath.Join(BootstrapDir, "bootstrap-ddl.sql") }
+	bootstrapAdminPasswordPath = func() string { return BootstrapDir + "/admin-password" }
+)
+
+// ApplyBootstrapDDL runs one idempotent pass of the bundle's
+// bootstrap-ddl.sql on this node: IF NOT EXISTS creates, the
+// Code 253 stale-znode drop-and-retry, and a failed count the caller
+// turns into a retryable error. It is the shared body of the boot's
+// bootstrap_schema step and the schema-bootstrap timer unit — the
+// heal path for a boot that lost the keeper race.
+func ApplyBootstrapDDL(ctx context.Context, hostname string) (*DDLApplyResult, error) {
+	ddlPath := bootstrapDDLPath()
 	data, err := os.ReadFile(ddlPath)
 	if err != nil {
 		// A bundle without the DDL is the pre-0.2.14 image shape —
 		// loud no-op, never fatal (the schema-sync path remains).
 		fmt.Fprintf(os.Stderr, "WARNING: bootstrap-ddl.sql not in the bundle (older AMI?) — schema bootstrap skipped: %v\n", err)
-		return nil
+		return &DDLApplyResult{DDLPath: ddlPath}, nil
 	}
-	pw, err := os.ReadFile(BootstrapDir + "/admin-password")
+	pw, err := os.ReadFile(bootstrapAdminPasswordPath())
 	if err != nil {
-		return fmt.Errorf("read admin password file: %w", err)
+		return nil, fmt.Errorf("read admin password file: %w", err)
 	}
 	adminPw := strings.TrimSpace(string(pw))
+	result := &DDLApplyResult{DDLPath: ddlPath}
 
 	// Statement-split: one statement per TOP-LEVEL terminator. The DDL
 	// carries SQL comments (-- headers explaining each object) and
@@ -537,8 +594,6 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	// and delimiter-depth-aware (semicolons inside parentheses —
 	// functions, codecs, tuples — never terminate a statement).
 	statements := splitSQLStatements(string(data))
-	created := 0
-	failed := 0
 	for _, stmt := range statements {
 		s := strings.TrimSpace(stmt)
 		if s == "" || !strings.Contains(s, "CREATE") {
@@ -561,16 +616,16 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 			// fresh disk whose parts do not exist), and the retried
 			// CREATE registers clean.
 			if strings.Contains(out, "Code: 253") || strings.Contains(err.Error(), "Code: 253") {
-				if tablePath, replicaName := ddlReplicaIdentity(s, b.Identity.Hostname); tablePath != "" {
+				if tablePath, replicaName := ddlReplicaIdentity(s, hostname); tablePath != "" {
 					dropSQL := fmt.Sprintf("SYSTEM DROP REPLICA '%s' FROM ZKPATH '%s'", replicaName, tablePath)
 					if dOut, dErr := execClient(ctx, adminPw, dropSQL); dErr != nil {
 						fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL stale-replica drop failed for %s: %v: %s\n", tablePath, dErr, strings.TrimSpace(dOut))
-						failed++
+						result.Failed++
 					} else if rOut, rErr := execClient(ctx, adminPw, s); rErr != nil {
 						fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed after drop (continuing): %v: %s\n", rErr, strings.TrimSpace(rOut))
-						failed++
+						result.Failed++
 					} else {
-						created++
+						result.Created++
 						fmt.Printf("schema bootstrap: %s re-created after dropping stale znode\n", tablePath)
 					}
 					continue
@@ -584,22 +639,13 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 			// keeper rolled in the same refresh — and the step
 			// "succeeded" on the one statement that did not need
 			// keeper, never retrying against the recovered keeper).
-			failed++
+			result.Failed++
 			fmt.Fprintf(os.Stderr, "WARNING: bootstrap DDL statement failed (continuing): %v: %s\n", err, strings.TrimSpace(out))
 			continue
 		}
-		created++
+		result.Created++
 	}
-	fmt.Printf("schema bootstrap: %d statement(s) applied from %s (%d failed)\n", created, ddlPath, failed)
-	// A retryable error surfaces when anything failed: the statement set
-	// is idempotent (IF NOT EXISTS + the drop-own-znode conflict path),
-	// so a re-run converges instead of wedging. BestEffort classification
-	// still keeps a final-pass failure from killing the boot — the
-	// schema-sync unit and health gate remain the heal paths.
-	if failed > 0 {
-		return fmt.Errorf("schema bootstrap: %d statement(s) failed (retrying; transient keeper races converge on the next pass)", failed)
-	}
-	return nil
+	return result, nil
 }
 
 // ddlReplicaIdentity extracts the keeper path and replica name from one
@@ -684,6 +730,9 @@ func splitSQLStatements(sql string) []string {
 // same credential shape the drain/disk-autoscale probes use — env, never
 // argv).
 func execClient(ctx context.Context, adminPw, query string) (string, error) {
+	if execClientFn != nil {
+		return execClientFn(ctx, adminPw, query)
+	}
 	cmd := exec.CommandContext(ctx, "clickhouse-client", "--user", "admin", "--password", adminPw, "--query", query)
 	cmd.Env = append(os.Environ(), "CLICKHOUSE_USER=admin", "CLICKHOUSE_PASSWORD="+adminPw)
 	out, err := cmd.CombinedOutput()
@@ -692,6 +741,10 @@ func execClient(ctx context.Context, adminPw, query string) (string, error) {
 	}
 	return string(out), nil
 }
+
+// execClientFn is the exec seam (tests substitute; production runs the
+// local clickhouse-client).
+var execClientFn func(ctx context.Context, adminPw, query string) (string, error)
 
 // healthGate runs the cluster health check as a library call — the
 // operator's health service over the chctl probe (the same code path

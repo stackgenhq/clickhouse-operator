@@ -73,6 +73,8 @@ func Run(args []string) error {
 		return runBoot(rest)
 	case "schema-sync":
 		return runSchemaSync(rest)
+	case "schema-bootstrap":
+		return runSchemaBootstrap(rest)
 	case "replica-sync":
 		return runReplicaSync(rest)
 	case "lease-renew":
@@ -139,6 +141,7 @@ subcommands.
 Usage:
   chinit boot [-spec chinit.yaml] [-cloud aws|azure] [-dry-run] [-refresh]
   chinit schema-sync [-retries N] [-prune-stale-self]
+  chinit schema-bootstrap
   chinit replica-sync
   chinit lease-renew
   chinit keeper-health

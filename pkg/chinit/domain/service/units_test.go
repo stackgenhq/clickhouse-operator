@@ -186,13 +186,24 @@ var _ = Describe("chinitUnits", func() {
 	})
 
 	Context("backup replica", func() {
-		It("installs nothing", func() {
+		It("installs only the schema-bootstrap convergence pair", func() {
 			spec := baseSpec()
 			spec.Role = model.RoleBackup
 			spec.IdentityMode = model.IdentityStatic
 			b := &Boot{Spec: &spec}
 
-			Expect(unitNames(b.chinitUnits())).To(BeEmpty())
+			// The backup replica materializes the same replicated
+			// tables, so it carries the DDL convergence unit — but no
+			// other cluster-maintenance units (the 2026-11-16 reader
+			// finding made the convergence pass universal).
+			Expect(unitNames(b.chinitUnits())).To(ConsistOf(
+				"schema-bootstrap.service", "schema-bootstrap.timer",
+			))
+			for _, u := range b.chinitUnits() {
+				if u.Name == "schema-bootstrap.timer" {
+					Expect(u.Content).To(ContainSubstring("*-*-* *:00/15:00"))
+				}
+			}
 		})
 	})
 })

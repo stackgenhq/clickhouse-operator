@@ -526,6 +526,36 @@ func runSchemaSync(args []string) error {
 	return nil
 }
 
+// runSchemaBootstrap is `chinit schema-bootstrap` (the 15-minute
+// convergence unit): one idempotent pass of the bundle DDL — the same
+// ApplyBootstrapDDL the boot's bootstrap_schema step runs. The 2026-11-16
+// finding: reader-0 exhausted the boot's retries while the keeper rolled
+// in the same instance refresh, and NOTHING re-ran the DDL afterward —
+// the node served reads schemaless for hours. This unit is the
+// after-the-boot heal path; the timer retries it until the pass is clean.
+func runSchemaBootstrap(args []string) error {
+	statePath, err := statePathFlag(args)
+	if err != nil {
+		return err
+	}
+	st, err := loadNodeState(statePath)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	result, err := service.ApplyBootstrapDDL(ctx, st.Identity.Hostname)
+	if err != nil {
+		return fmt.Errorf("schema bootstrap failed (retry on timer): %w", err)
+	}
+	fmt.Printf("schema bootstrap: %d statement(s) applied from %s (%d failed)\n", result.Created, result.DDLPath, result.Failed)
+	if result.Failed > 0 {
+		// Non-zero exit: the timer unit's OnFailure semantics and the
+		// journal contract surface a failed pass; the next tick retries.
+		return fmt.Errorf("schema bootstrap: %d statement(s) failed (retry on timer)", result.Failed)
+	}
+	return nil
+}
+
 // runReplicaSync is `chinit replica-sync` (the per-boot unit):
 // SYSTEM SYNC REPLICA for every replicated table on this host.
 func runReplicaSync(args []string) error {

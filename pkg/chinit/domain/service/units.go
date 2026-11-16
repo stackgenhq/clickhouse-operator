@@ -99,6 +99,15 @@ func (b *Boot) chinitUnits() []system.UnitFile {
 			b.chinitUnit("replica-sync.service", "Post-boot replica synchronization (SYSTEM SYNC REPLICA)", "replica-sync"),
 			b.chinitUnit("schema-sync.service", "ClickHouse schema auto-propagation from cluster peers", "schema-sync -retries 3 -prune-stale-self"),
 			chinitTimer("schema-sync.timer", "Run schema sync periodically", "hourly"),
+			// Self-healing schema convergence: the boot's DDL pass can
+			// lose the keeper race (the keeper rolls in the same
+			// instance refresh) and its retries exhaust — this unit
+			// re-runs the same idempotent bundle DDL every 15 minutes
+			// until the pass is clean. The 2026-11-16 finding: a
+			// reader stayed schemaless for HOURS after its boot gave
+			// up, because nothing after the boot re-applied the DDL.
+			b.chinitUnit("schema-bootstrap.service", "Bundle DDL convergence pass (idempotent re-apply)", "schema-bootstrap"),
+			chinitTimer("schema-bootstrap.timer", "Re-apply the bundle DDL until the pass is clean", "*-*-* *:00/15:00"),
 			// Self-healing disk headroom: effective free below the
 			// floor (the keep_free_space-aware number merges gate on)
 			// grows the node's own volume + filesystem online. The
@@ -135,7 +144,12 @@ func (b *Boot) chinitUnits() []system.UnitFile {
 			)
 		}
 	case model.RoleBackup:
-		// The backup replica needs no cluster-maintenance units.
+		// The backup replica still carries the DDL convergence pass —
+		// it materializes the same replicated tables to serve backups.
+		units = append(units,
+			b.chinitUnit("schema-bootstrap.service", "Bundle DDL convergence pass (idempotent re-apply)", "schema-bootstrap"),
+			chinitTimer("schema-bootstrap.timer", "Re-apply the bundle DDL until the pass is clean", "*-*-* *:00/15:00"),
+		)
 	}
 	return units
 }
