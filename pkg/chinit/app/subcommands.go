@@ -67,6 +67,14 @@ type inventorySpec struct {
 	// of their own (the maintenance jobs list it for the writer-GC
 	// liveness guard; the state's own LeaseTable wins when present).
 	ClaimerTableName string `yaml:"claimer_table_name"`
+	// BackupReplicaHostname rides the hosts-file convergence: the
+	// backup is a CR member and part-fetch source but holds NO lease,
+	// so the claim scan never lists it (the 2026-11-16 Code 198
+	// finding). Its ADDRESS is derived at convergence time by resolving
+	// the FQDN through the private zone (Route53's Terraform-managed
+	// record) — never rendered into the spec, so a re-provisioned
+	// backup converges without a bundle re-render.
+	BackupReplicaHostname string `yaml:"backup_replica_hostname,omitempty"`
 }
 
 // hostInventory renders the CR-name → address pairs for the chctl
@@ -698,6 +706,12 @@ func runLeaseRenew(args []string) error {
 			args.WriterPrefix = spec.writerPrefix()
 			args.ReaderPrefix = spec.readerPrefix()
 			args.DNSZoneName = spec.DNSZoneName
+			// The lease-less backup replica: the claim scan never
+			// lists it, so its hosts line rides the hostname (the
+			// address is resolved at convergence time — the
+			// 2026-11-16 Code 198 finding: peers resolving its
+			// short name for part fetches died on DNS_ERROR).
+			args.BackupReplicaHostname = spec.BackupReplicaHostname
 		}
 		if err := service.ConvergePeerHosts(ctx, provider, args); err != nil {
 			slog.Warn("lease-renew: peer-hosts convergence failed", "err", err)
@@ -774,6 +788,9 @@ func convergeStaticNodePeers(args []string, st *nodeState) error {
 		WriterPrefix: spec.writerPrefix(),
 		ReaderPrefix: spec.readerPrefix(),
 		DNSZoneName:  spec.DNSZoneName,
+		// The lease-less backup replica (Code 198): hostname only —
+		// the address resolves at convergence time.
+		BackupReplicaHostname: spec.BackupReplicaHostname,
 	}
 	if err := service.ConvergePeerHosts(context.Background(), provider, hostsArgs); err != nil {
 		slog.Warn("lease-renew: peer-hosts convergence failed", "err", err)
@@ -881,15 +898,13 @@ func pushKeeperUp(ctx context.Context, st *nodeState, up float64) {
 	}
 }
 
-// diskAutoscaleConfig bounds the disk-autoscale job. The floor keys
-// on EFFECTIVE free space — what system.disks.free_space reports after
-// the keep_free_space reservation — because that is the number
-// ClickHouse refuses writes at (df shows the pre-reservation view and
-// lies by the reservation size: the 2026-11-14 incident had 30% free
-// in df and ~1 MiB effective).
+// diskAutoscaleConfig bounds the disk-autoscale job. The grow FLOOR
+// is not here — it is DERIVED at probe time from the running server's
+// own keep_free_space + diskFloorHeadroom, so the job can never
+// disagree with the storage XML's reservation (the 2026-11-16 dead
+// zone: a hardcoded 8 GiB floor sat below keep_free_space_bytes
+// 10 GiB and the node refused writes while the job saw headroom).
 type diskAutoscaleConfig struct {
-	// FloorGB is the effective-free threshold that triggers growth.
-	FloorGB float64
 	// GrowthGB is the increment per grow event.
 	GrowthGB float64
 	// MaxGB is the ceiling (a runaway job must never grow a volume
@@ -908,7 +923,6 @@ type diskAutoscaleConfig struct {
 // module's launch-template convention (/dev/sdb → /var/lib/clickhouse).
 func defaultDiskAutoscaleConfig() diskAutoscaleConfig {
 	return diskAutoscaleConfig{
-		FloorGB:        8,
 		GrowthGB:       32,
 		MaxGB:          256,
 		DataDiskDevice: "/dev/sdb",
@@ -916,10 +930,24 @@ func defaultDiskAutoscaleConfig() diskAutoscaleConfig {
 	}
 }
 
-// diskFreeQuery is the health probe: effective free bytes on the
-// default disk straight from the server (the number the merge engine
-// gates writes on), not df.
-const diskFreeQuery = "SELECT free_space FROM system.disks WHERE name = 'default'"
+// diskFreeQuery is the health probe: the metric writes actually gate
+// on. UNRESERVED space is what the reservation book hands a new write
+// — free_space minus everything background operations hold (fetch
+// storms, merges, part moves). Keying the grow floor on free_space
+// was the 2026-11-16 dead zone: Code 243 NOT_ENOUGH_SPACE fired at
+// 11 GiB free (floor 8) because unreserved was ~0 under the
+// back-fill fetch storm — the node refused writes while the job saw
+// headroom. keep_free_space rides the same probe so the FLOOR is
+// derived from the running server's own reservation config — never
+// a hardcoded number the storage XML can silently disagree with
+// (the floor-must-exceed-keep_free invariant holds by construction).
+const diskFreeQuery = "SELECT unreserved_space, keep_free_space FROM system.disks WHERE name = 'default'"
+
+// diskFloorHeadroom is the margin above keep_free_space that the
+// grow floor carries: once unreserved drops below keep_free + this,
+// the volume grows. 2 GiB keeps a fetch storm from hitting the
+// refuse-window between timer ticks.
+const diskFloorHeadroom = 2 << 30
 
 // runDiskAutoscale is `chinit disk-autoscale` (the writers'/readers'
 // timer): keep effective disk headroom above the floor by growing the
@@ -946,14 +974,24 @@ func runDiskAutoscale(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	freeBytes, err := diskEffectiveFree(ctx)
+	freeBytes, keepFreeBytes, err := diskEffectiveFree(ctx)
 	if err != nil {
 		return fmt.Errorf("disk-autoscale: effective free probe failed: %w", err)
 	}
+	// The floor is DERIVED from the running server's own reservation
+	// config: keep_free_space + headroom. The 2026-11-16 dead zone
+	// was a hardcoded floor (8 GiB) below storage.xml's
+	// keep_free_space_bytes (10 GiB) — the node entered the total
+	// write-refuse window (Code 243) while the job still saw
+	// headroom. Deriving keeps the invariant (floor >
+	// keep_free_space) true by construction, whatever the XML says.
+	floorBytes := keepFreeBytes + diskFloorHeadroom
 	freeGB := float64(freeBytes) / (1 << 30)
-	fmt.Printf("disk-autoscale: effective free %.2f GiB (floor %.0f GiB)\n", freeGB, cfg.FloorGB)
+	floorGB := float64(floorBytes) / (1 << 30)
+	fmt.Printf("disk-autoscale: unreserved %.2f GiB (floor %.2f GiB = keep_free %.2f + headroom %.0f)\n",
+		freeGB, floorGB, float64(keepFreeBytes)/(1<<30), float64(diskFloorHeadroom)/(1<<30))
 
-	if freeGB >= cfg.FloorGB {
+	if freeBytes >= floorBytes {
 		return nil
 	}
 
@@ -1015,8 +1053,9 @@ func runDiskAutoscale(args []string) error {
 }
 
 // diskEffectiveFree queries the local server for the default disk's
-// effective free bytes (after keep_free_space). Credentials go to the
-// client via CLICKHOUSE_USER/CLICKHOUSE_PASSWORD env — argv is
+// unreserved bytes (the reservation book's answer to a new write) and
+// the keep_free_space the storage config demands. Credentials go to
+// the client via CLICKHOUSE_USER/CLICKHOUSE_PASSWORD env — argv is
 // world-readable in /proc/<pid>/cmdline for the process's whole
 // lifetime, env only while the reader can inspect the process. The
 // bare client defaults to the `default` user, whose profile is
@@ -1024,17 +1063,23 @@ func runDiskAutoscale(args []string) error {
 // a password is configured (AUTHENTICATION_FAILED — the live 0.2.4
 // finding: the probe ran before the password was threaded and every
 // timer start failed).
-func diskEffectiveFree(ctx context.Context) (uint64, error) {
+func diskEffectiveFree(ctx context.Context) (unreserved, keepFree uint64, err error) {
 	args := []string{"--query", diskFreeQuery}
 	out, err := runCommandWithEnv(ctx, clickhouseClientEnv(), "clickhouse-client", args...)
 	if err != nil {
-		return 0, fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
+		return 0, 0, fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}
-	v, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse free_space %q: %w", strings.TrimSpace(string(out)), err)
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) != 2 {
+		return 0, 0, fmt.Errorf("parse disks probe %q: expected <unreserved> <keep_free>", strings.TrimSpace(string(out)))
 	}
-	return v, nil
+	if unreserved, err = strconv.ParseUint(fields[0], 10, 64); err != nil {
+		return 0, 0, fmt.Errorf("parse unreserved_space %q: %w", fields[0], err)
+	}
+	if keepFree, err = strconv.ParseUint(fields[1], 10, 64); err != nil {
+		return 0, 0, fmt.Errorf("parse keep_free_space %q: %w", fields[1], err)
+	}
+	return unreserved, keepFree, nil
 }
 
 // growFilesystem extends the ext4 filesystem to the grown device.

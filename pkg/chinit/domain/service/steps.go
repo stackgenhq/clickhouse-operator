@@ -843,5 +843,10 @@ func (b *Boot) configurePeerHosts(ctx context.Context) error {
 		WriterPrefix: b.Spec.WriterPrefix(),
 		ReaderPrefix: b.Spec.ReaderPrefix(),
 		DNSZoneName:  b.Spec.DNSZoneName,
+		// The lease-less backup replica: the claim scan never lists
+		// it, so its hosts line rides the hostname (the address is
+		// resolved at convergence time — Code 198 on every peer
+		// resolving its short name for part fetches otherwise).
+		BackupReplicaHostname: b.Spec.Backup.BackupReplicaHostname,
 	})
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 
@@ -39,6 +40,16 @@ type ConvergeHostsArgs struct {
 	// DNSZoneName is the FQDN suffix the line's third field carries
 	// (writer-0 writer-0.zone) so FQDN resolution benefits too.
 	DNSZoneName string
+	// BackupReplicaHostname appends the LEASE-LESS backup replica to
+	// the hosts file. The backup is a CR member and a part-fetch
+	// source, but it holds no ordinal lease — the claim scan never
+	// sees it, so without this field every peer resolving its short
+	// name for a fetch died on DNS_ERROR Code 198 (the 2026-11-16
+	// CloudWatch finding: 14 errors/node/hour, queues stalled). The
+	// ADDRESS is derived at convergence time by resolving the FQDN
+	// through the private zone — never carried in the spec, so a
+	// re-provisioned backup converges without a bundle re-render.
+	BackupReplicaHostname string
 }
 
 // ConvergePeerHosts is the periodic /etc/hosts convergence for server
@@ -111,7 +122,14 @@ func writePeerHostsFile(claims []port.Claim, args ConvergeHostsArgs) error {
 		var kept []string
 		for _, line := range strings.Split(string(existing), "\n") {
 			stale := false
-			for _, prefix := range []string{writerPrefix, readerPrefix} {
+			sweepPrefixes := []string{writerPrefix, readerPrefix}
+			// The backup line is swept with the claims (its IP is
+			// re-resolved below each convergence, so a stale IP from
+			// a re-provisioned backup never lingers).
+			if args.BackupReplicaHostname != "" {
+				sweepPrefixes = append(sweepPrefixes, args.BackupReplicaHostname)
+			}
+			for _, prefix := range sweepPrefixes {
 				for _, field := range strings.Fields(line) {
 					if strings.HasPrefix(field, prefix) {
 						stale = true
@@ -135,11 +153,39 @@ func writePeerHostsFile(claims []port.Claim, args ConvergeHostsArgs) error {
 
 	var b strings.Builder
 	entries := 0
+	// The lease-less backup replica first: same hosts-file line shape
+	// as a claim (IP + short name + FQDN). It is a CR member and a
+	// part-fetch source — the claim scan cannot carry it. The ADDRESS
+	// is resolved HERE from the private zone (the VPC resolver answers
+	// the Route53 record Terraform manages), never rendered into the
+	// spec: a re-provisioned backup with a new IP converges on the
+	// next tick without a bundle re-render. An empty answer (backup
+	// down or record gone) writes no line — same contract as a claim
+	// row with no IP.
+	if args.BackupReplicaHostname != "" {
+		var fqdn string
+		if args.DNSZoneName != "" {
+			fqdn = args.BackupReplicaHostname + "." + args.DNSZoneName
+		} else {
+			fqdn = args.BackupReplicaHostname
+		}
+		if addrs, rerr := net.LookupHost(fqdn); rerr == nil && len(addrs) > 0 {
+			if args.DNSZoneName != "" {
+				fmt.Fprintf(&b, "%s %s %s\n", addrs[0], args.BackupReplicaHostname, fqdn)
+			} else {
+				fmt.Fprintf(&b, "%s %s\n", addrs[0], args.BackupReplicaHostname)
+			}
+			entries++
+		} else if rerr != nil {
+			slog.Warn("peer-hosts: backup replica FQDN did not resolve; no hosts line written",
+				"fqdn", fqdn, "err", rerr)
+		}
+	}
 	for _, claim := range claims {
 		writer := strings.HasPrefix(claim.Hostname, writerPrefix)
 		reader := strings.HasPrefix(claim.Hostname, readerPrefix)
 		if !writer && !reader {
-			continue // foreign row (backup-0, keeper-N): not fetch sources
+			continue // foreign row (keeper-N): not fetch sources
 		}
 		if claim.IP == "" {
 			continue
