@@ -152,13 +152,22 @@ func (b *Boot) CRName() (string, int) {
 		// the writers ASG max), NOT the live writer count — scaling
 		// writers must never re-key reader CR slots. Interim: WriterCount
 		// when WriterMax is unset (static writer specs).
-		offset := b.Spec.WriterMax
-		if offset == 0 {
-			offset = b.Spec.WriterCount
-		}
+		offset := b.Spec.WriterCeiling()
 		return fmt.Sprintf("01-%d", offset+ordinal), offset + ordinal
 	case model.RoleBackup:
-		return "", -1
+		// The backup replica IS a CR member (it materializes the same
+		// replicated tables) and takes the FIRST slot after the
+		// readers' ceiling: 01-{writerCeiling + readerCeiling}. The
+		// 2026-11-16 finding: an empty CRName meant the host-group
+		// render never ran on backup (no chop-generated-macros.xml, no
+		// zookeeper section) — the server crash-looped Code 139 (no
+		// {replica} macro for storage paths) and Code 225
+		// (NO_ZOOKEEPER) on every boot. Terraform renders the backup's
+		// slot into replicasCount (the +1 when backup is enabled), so
+		// findHost matches and macros/zookeeper/settings render like
+		// any writer/reader.
+		ordinal := b.Spec.WriterCeiling() + b.Spec.ReaderCeiling()
+		return fmt.Sprintf("01-%d", ordinal), ordinal
 	default:
 		return "", -1
 	}

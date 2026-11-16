@@ -186,17 +186,30 @@ var _ = Describe("CRName", func() {
 	})
 
 	Context("keepers and the backup replica", func() {
-		It("carry no CR name (they are not CR members)", func() {
+		It("keeps keepers CR-less while the backup takes the slot after the readers' ceiling", func() {
+			// Keepers are genuinely NOT CR members (the keeper render is
+			// single-file; no macros/remote_servers render for them).
 			keeper := &Boot{Spec: &model.BootSpec{Role: model.RoleKeeper}}
 			keeper.Identity.CROrdinal = 0
 			name, ordinal := keeper.CRName()
 			Expect(name).To(BeEmpty())
 			Expect(ordinal).To(Equal(-1))
 
-			backup := &Boot{Spec: &model.BootSpec{Role: model.RoleBackup}}
+			// The backup replica IS a CR member (2026-11-16 fix): it
+			// materializes the same replicated tables, so the host-group
+			// render (macros <replica>, the zookeeper section) must run
+			// for it — an empty CRName meant no chop-generated-macros.xml
+			// and Code 139/225 crash-loops. Its slot: the FIRST after
+			// the readers' ceiling, matching Terraform's replica_count
+			// +1 and crNameFromHostname.
+			backup := &Boot{Spec: &model.BootSpec{
+				Role:       model.RoleBackup,
+				WriterMax:  4,
+				ReaderMax:  4,
+			}}
 			name, ordinal = backup.CRName()
-			Expect(name).To(BeEmpty())
-			Expect(ordinal).To(Equal(-1))
+			Expect(name).To(Equal("01-8"))
+			Expect(ordinal).To(Equal(8))
 		})
 	})
 })

@@ -231,6 +231,19 @@ func claimsInventory(b *Boot, claims []port.Claim) []domain.HostIdentity {
 		// which encodes the slot — is a total order.
 		return hosts[i].Name < hosts[j].Name
 	})
+	// The backup replica holds no lease (static identity) but IS a CR
+	// member — append it so lease-mode inventories (the writers'/readers'
+	// remote_servers) include the backup like the static path does.
+	if b.Spec.Backup.BackupReplicaHostname != "" {
+		ordinal := ceiling + b.Spec.ReaderCeiling()
+		hosts = append(hosts, domain.HostIdentity{
+			Cloud:   b.Provider.Name(),
+			Region:  b.Meta.Region,
+			Name:    fmt.Sprintf("01-%d", ordinal),
+			Address: fmt.Sprintf("%s.%s", b.Spec.Backup.BackupReplicaHostname, b.Spec.DNSZoneName),
+			Role:    domain.RoleBackup,
+		})
+	}
 	return hosts
 }
 
@@ -279,6 +292,22 @@ func staticSpecInventory(b *Boot) []domain.HostIdentity {
 			Name:    fmt.Sprintf("01-%d", ceiling+i),
 			Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
 			Role:    domain.RoleReader,
+		})
+	}
+	// The backup replica (static identity, no lease): its CR slot is the
+	// first after the readers' ceiling — the same slot CRName() derives
+	// for the role and Terraform renders into replicasCount. Without the
+	// entry, remote_servers on OTHER nodes omit the backup and the
+	// backup's own render misses its self-entry (the 2026-11-16 finding:
+	// the backup rendered VACANT slots instead of the live members).
+	if b.Spec.Backup.BackupReplicaHostname != "" {
+		ordinal := ceiling + b.Spec.ReaderCeiling()
+		hosts = append(hosts, domain.HostIdentity{
+			Cloud:   b.Provider.Name(),
+			Region:  b.Meta.Region,
+			Name:    fmt.Sprintf("01-%d", ordinal),
+			Address: fmt.Sprintf("%s.%s", b.Spec.Backup.BackupReplicaHostname, b.Spec.DNSZoneName),
+			Role:    domain.RoleBackup,
 		})
 	}
 	return hosts

@@ -250,8 +250,10 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 }
 
 // crNameFromHostname derives the CR slot ("01-<n>") from a settled hostname:
-// writers occupy slots 0..WriterMax-1, readers occupy WriterMax..WriterMax+ReaderMax-1.
-// Returns ok=false for hostnames that carry no CR slot (keepers, backup).
+// writers occupy slots 0..WriterMax-1, readers occupy WriterMax..WriterMax+ReaderMax-1,
+// and the backup replica takes the first slot after the readers' ceiling
+// (the +1 Terraform renders into replicasCount when backup is enabled).
+// Returns ok=false for hostnames that carry no CR slot (keepers).
 func crNameFromHostname(spec *model.BootSpec, hostname string) (string, int, bool) {
 	writerPrefix := spec.WriterHostPrefix
 	if writerPrefix == "" {
@@ -267,13 +269,15 @@ func crNameFromHostname(spec *model.BootSpec, hostname string) (string, int, boo
 			return fmt.Sprintf("01-%d", n), n, true
 		}
 	case strings.HasPrefix(hostname, readerPrefix):
-		offset := spec.WriterMax
-		if offset == 0 {
-			offset = spec.WriterCount
-		}
+		offset := spec.WriterCeiling()
 		if n, err := strconv.Atoi(strings.TrimPrefix(hostname, readerPrefix)); err == nil && n >= 0 {
 			return fmt.Sprintf("01-%d", offset+n), offset + n, true
 		}
+	case strings.HasPrefix(hostname, spec.Backup.BackupReplicaHostname) && spec.Backup.BackupReplicaHostname != "":
+		// The backup's CR slot: the first after the readers' ceiling —
+		// the same arithmetic CRName() lands for the role.
+		ordinal := spec.WriterCeiling() + spec.ReaderCeiling()
+		return fmt.Sprintf("01-%d", ordinal), ordinal, true
 	}
 	return "", 0, false
 }

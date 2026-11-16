@@ -42,6 +42,9 @@ const (
 	RoleReader Role = "reader"
 	// RoleKeeper is a ClickHouse Keeper (Raft) node.
 	RoleKeeper Role = "keeper"
+	// RoleBackup is the dedicated backup replica (a replicated-table
+	// member; CR slot after the readers' ceiling).
+	RoleBackup Role = "backup"
 )
 
 // HostIdentity identifies one cluster node, cloud-neutrally. Callers fill
