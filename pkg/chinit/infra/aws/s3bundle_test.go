@@ -57,12 +57,11 @@ func (m *missingKey) Error() string { return "NoSuchKey: " + m.key }
 // backup-replica XMLs + chi.yaml); specs mutate from here.
 func bundleKeys() map[string]string {
 	return map[string]string{
-		"bootstrap/configs/network.xml":                 "<network/>",
-		"bootstrap/configs/ssl.xml":                     "<ssl/>",
-		"bootstrap/configs/storage.xml":                 "<storage/>",
-		"bootstrap/configs/backup-replica-settings.xml": "<backup-replica/>",
-		"bootstrap/configs/bootstrap-ddl.sql":           "-- ddl",
-		"bootstrap/chi.yaml":                            "chi: spec",
+		"bootstrap/configs/network.xml":       "<network/>",
+		"bootstrap/configs/ssl.xml":           "<ssl/>",
+		"bootstrap/configs/storage.xml":       "<storage/>",
+		"bootstrap/configs/bootstrap-ddl.sql": "-- ddl",
+		"bootstrap/chi.yaml":                  "chi: spec",
 	}
 }
 
@@ -79,12 +78,17 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 			// The layout the stack uploads and the refresh path
 			// consumes; <prefix>/<name>.xml 404s on a real bucket
 			// (the live chinit-v0.1.0 boot failed exactly this way).
+			// backup-replica-settings.xml left the bundle contract
+			// (the 2026-11-16 port): the overlay renders built-in in
+			// the installer; neither the fetch nor the digest carries
+			// it.
 			written, err := fetch(bundleKeys(), model.ConfigBundle{Bucket: "data-bucket", Prefix: "bootstrap"})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(written).To(HaveLen(6))
-			for _, name := range []string{"network.xml", "ssl.xml", "storage.xml", "backup-replica-settings.xml", "bootstrap-ddl.sql", "chi.yaml"} {
+			Expect(written).To(HaveLen(5))
+			for _, name := range []string{"network.xml", "ssl.xml", "storage.xml", "bootstrap-ddl.sql", "chi.yaml"} {
 				Expect(written).To(ContainElement(HaveSuffix("/" + name)))
 			}
+			Expect(written).NotTo(ContainElement(HaveSuffix("/backup-replica-settings.xml")))
 			// keeper.yaml NoSuchKey is benign (single-role stacks skip
 			// it).
 			Expect(written).NotTo(ContainElement(HaveSuffix("/keeper.yaml")))
@@ -118,12 +122,11 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 			chi := "apiVersion: clickhouse.altinity.com/v1\nkind: ClickHouseInstallation\n"
 
 			merge := map[string]string{
-				"configs/network.xml":                 net,
-				"configs/ssl.xml":                     ssl,
-				"configs/storage.xml":                 stor,
-				"configs/backup-replica-settings.xml": "<backup-replica/>",
-				"configs/bootstrap-ddl.sql":           "-- ddl",
-				"chi.yaml":                            chi,
+				"configs/network.xml":       net,
+				"configs/ssl.xml":           ssl,
+				"configs/storage.xml":       stor,
+				"configs/bootstrap-ddl.sql": "-- ddl",
+				"chi.yaml":                  chi,
 			}
 			enc, err := json.Marshal(merge) // jsonencode: sorted pairs, escaped values
 			Expect(err).NotTo(HaveOccurred())
@@ -131,16 +134,15 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 			wantHex := hex.EncodeToString(want[:])
 
 			keys := map[string]string{
-				"bootstrap/configs/network.xml":                 net,
-				"bootstrap/configs/ssl.xml":                     ssl,
-				"bootstrap/configs/storage.xml":                 stor,
-				"bootstrap/configs/backup-replica-settings.xml": "<backup-replica/>",
-				"bootstrap/configs/bootstrap-ddl.sql":           "-- ddl",
-				"bootstrap/chi.yaml":                            chi,
+				"bootstrap/configs/network.xml":       net,
+				"bootstrap/configs/ssl.xml":           ssl,
+				"bootstrap/configs/storage.xml":       stor,
+				"bootstrap/configs/bootstrap-ddl.sql": "-- ddl",
+				"bootstrap/chi.yaml":                  chi,
 			}
 			written, err := fetch(keys, model.ConfigBundle{Bucket: "data-bucket", Prefix: "bootstrap", SHA256: wantHex})
 			Expect(err).NotTo(HaveOccurred(), "the gate MUST accept Terraform's own digest; got: %v", err)
-			Expect(written).To(HaveLen(6))
+			Expect(written).To(HaveLen(5))
 
 			// And a one-bit content change must be refused.
 			keys["bootstrap/configs/storage.xml"] = stor + "\n<!-- edited -->"
@@ -153,12 +155,11 @@ var _ = Describe("S3BundleSource.FetchBundle", func() {
 			// A writer stack and a keeper stack with the same
 			// config_files_hash both pass the gate.
 			merge := map[string]string{
-				"configs/network.xml":                 "<network/>",
-				"configs/ssl.xml":                     "<ssl/>",
-				"configs/storage.xml":                 "<storage/>",
-				"configs/backup-replica-settings.xml": "<backup-replica/>",
-				"configs/bootstrap-ddl.sql":           "-- ddl",
-				"chi.yaml":                            "chi: spec",
+				"configs/network.xml":       "<network/>",
+				"configs/ssl.xml":           "<ssl/>",
+				"configs/storage.xml":       "<storage/>",
+				"configs/bootstrap-ddl.sql": "-- ddl",
+				"chi.yaml":                  "chi: spec",
 			}
 			enc, err := json.Marshal(merge)
 			Expect(err).NotTo(HaveOccurred())

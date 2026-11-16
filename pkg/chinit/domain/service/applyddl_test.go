@@ -34,11 +34,11 @@ import (
 
 var _ = Describe("ApplyBootstrapDDL", func() {
 	var (
-		dir           string
-		queries       []string
-		failOn        map[string]string
-		restoreExec   func()
-		restorePaths  func()
+		dir          string
+		queries      []string
+		failOn       map[string]string
+		restoreExec  func()
+		restorePaths func()
 	)
 
 	BeforeEach(func() {
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 	})
 
 	It("applies every CREATE and reports zero failures on a clean pass", func() {
-		result, err := ApplyBootstrapDDL(context.Background(), "writer-0")
+		result, err := ApplyBootstrapDDL(context.Background(), "writer-0", "writer")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.Created).To(Equal(2))
 		Expect(result.Failed).To(Equal(0))
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 	It("counts failures so the caller surfaces a retryable error", func() {
 		failOn["CREATE TABLE IF NOT EXISTS events (id String) ENGINE = ReplicatedMergeTree('/clickhouse/tables/01/events', '{replica}')"] =
 			"Code: 999. ZooKeeper connection refused"
-		result, err := ApplyBootstrapDDL(context.Background(), "writer-0")
+		result, err := ApplyBootstrapDDL(context.Background(), "writer-0", "writer")
 		Expect(err).NotTo(HaveOccurred(), "the pass itself errors only on missing credentials; statement failures COUNT")
 		Expect(result.Failed).To(Equal(1))
 		Expect(result.Created).To(Equal(1))
@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 			}
 			return "", nil
 		}
-		result, err := ApplyBootstrapDDL(context.Background(), "writer-0")
+		result, err := ApplyBootstrapDDL(context.Background(), "writer-0", "writer")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.Created).To(Equal(2))
 		Expect(result.Failed).To(Equal(0))
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 			}
 			return "", nil
 		}
-		result, err := ApplyBootstrapDDL(context.Background(), "reader-0")
+		result, err := ApplyBootstrapDDL(context.Background(), "reader-0", "reader")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.Created).To(Equal(1))
 		Expect(queries).To(ContainElement("SYSTEM DROP REPLICA 'reader-0' FROM ZKPATH '/clickhouse/tables/01/events'"))
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 
 	It("no-ops loudly when the bundle carries no DDL (pre-0.2.14 AMI)", func() {
 		Expect(os.Remove(filepath.Join(dir, "bootstrap-ddl.sql"))).To(Succeed())
-		result, err := ApplyBootstrapDDL(context.Background(), "writer-0")
+		result, err := ApplyBootstrapDDL(context.Background(), "writer-0", "writer")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.Created).To(Equal(0))
 		Expect(result.Failed).To(Equal(0))
@@ -160,3 +160,68 @@ CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/st
 type errString struct{ s string }
 
 func (e *errString) Error() string { return e.s }
+
+var _ = Describe("ApplyBootstrapDDL role filter", func() {
+	var (
+		dir     string
+		queries []string
+		failOn  map[string]string
+	)
+
+	BeforeEach(func() {
+		dir = filepath.Join(os.TempDir(), "chinit-apply-ddl-roles")
+		Expect(os.MkdirAll(dir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(dir, "bootstrap-ddl.sql"), []byte(
+			`-- Fleet schema: role-universal (every server node)
+CREATE TABLE IF NOT EXISTS events (id String) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/events', '{replica}');
+-- The staged-ingest pipeline: writers/readers ONLY (the backup's IAM
+-- cannot list staging — Code 499 AccessDenied on the queue's poll,
+-- the 2026-11-16 backup-0 finding).
+--    chinit:roles=writer,reader
+CREATE TABLE IF NOT EXISTS staging_synth (id String) ENGINE = S3Queue('s3://x/staging/', 'NDJSON', 'auto');
+CREATE MATERIALIZED VIEW IF NOT EXISTS staging_to_events TO default.events AS SELECT id FROM staging_synth;
+`), 0644)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(dir, "admin-password"), []byte("sekrit\n"), 0600)).To(Succeed())
+
+		queries = nil
+		failOn = map[string]string{}
+		execClientFn = func(_ context.Context, _, query string) (string, error) {
+			queries = append(queries, query)
+			if msg, ok := failOn[query]; ok {
+				return msg, &errString{msg}
+			}
+			return "", nil
+		}
+		DeferCleanup(func() { execClientFn = nil })
+
+		ddl := bootstrapDDLPath
+		pw := bootstrapAdminPasswordPath
+		DeferCleanup(func() { bootstrapDDLPath, bootstrapAdminPasswordPath = ddl, pw })
+		bootstrapDDLPath = func() string { return filepath.Join(dir, "bootstrap-ddl.sql") }
+		bootstrapAdminPasswordPath = func() string { return filepath.Join(dir, "admin-password") }
+	})
+
+	It("skips the staging pipeline on the backup role", func() {
+		result, err := ApplyBootstrapDDL(context.Background(), "backup-0", "backup")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Created).To(Equal(1), "only the role-universal events table")
+		Expect(result.Skipped).To(Equal(2), "the queue + MV are writer/reader-tagged")
+		for _, q := range queries {
+			Expect(q).NotTo(ContainSubstring("staging"), "no staging object on the backup")
+		}
+	})
+
+	It("applies the staging pipeline on the writer role", func() {
+		result, err := ApplyBootstrapDDL(context.Background(), "writer-0", "writer")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Created).To(Equal(3))
+		Expect(result.Skipped).To(Equal(0))
+	})
+
+	It("applies the staging pipeline on the reader role", func() {
+		result, err := ApplyBootstrapDDL(context.Background(), "reader-0", "reader")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Created).To(Equal(3))
+		Expect(result.Skipped).To(Equal(0))
+	})
+})

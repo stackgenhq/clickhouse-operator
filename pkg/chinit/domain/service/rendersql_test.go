@@ -32,8 +32,8 @@ var _ = Describe("splitSQLStatements", func() {
 		sql := "CREATE TABLE a (x String) ENGINE = MergeTree;\nCREATE TABLE b (y String) ENGINE = MergeTree;\n"
 		statements := splitSQLStatements(sql)
 		Expect(statements).To(HaveLen(2))
-		Expect(statements[0]).To(ContainSubstring("CREATE TABLE a"))
-		Expect(statements[1]).To(ContainSubstring("CREATE TABLE b"))
+		Expect(statements[0].sql).To(ContainSubstring("CREATE TABLE a"))
+		Expect(statements[1].sql).To(ContainSubstring("CREATE TABLE b"))
 	})
 
 	It("keeps parenthesized semicolons inside one statement", func() {
@@ -43,8 +43,8 @@ var _ = Describe("splitSQLStatements", func() {
 		sql := "CREATE TABLE t (ts DateTime CODEC(Delta(8), ZSTD(1))) TTL ts + toIntervalDay(7) SETTINGS index_granularity = 8192;"
 		statements := splitSQLStatements(sql)
 		Expect(statements).To(HaveLen(1))
-		Expect(statements[0]).To(ContainSubstring("ZSTD(1)"))
-		Expect(statements[0]).To(ContainSubstring("index_granularity = 8192"))
+		Expect(statements[0].sql).To(ContainSubstring("ZSTD(1)"))
+		Expect(statements[0].sql).To(ContainSubstring("index_granularity = 8192"))
 	})
 
 	It("strips line comments before splitting", func() {
@@ -54,17 +54,17 @@ var _ = Describe("splitSQLStatements", func() {
 		sql := "-- Why this exists: the churn finding.\n-- Second comment line.\nCREATE TABLE c (z String) ENGINE = MergeTree;"
 		statements := splitSQLStatements(sql)
 		Expect(statements).To(HaveLen(1))
-		Expect(statements[0]).NotTo(ContainSubstring("churn finding"))
-		Expect(statements[0]).To(ContainSubstring("CREATE TABLE c"))
+		Expect(statements[0].sql).NotTo(ContainSubstring("churn finding"))
+		Expect(statements[0].sql).To(ContainSubstring("CREATE TABLE c"))
 	})
 
 	It("drops comment-only segments and trailing whitespace", func() {
 		sql := "-- header comment\n\nCREATE TABLE d (w String);\n-- trailing comment\n"
 		statements := splitSQLStatements(sql)
 		onlyCreate := []string{}
-		for _, s := range statements {
-			if len(s) > 0 && containsCreate(s) {
-				onlyCreate = append(onlyCreate, s)
+		for _, t := range statements {
+			if len(t.sql) > 0 && containsCreate(t.sql) {
+				onlyCreate = append(onlyCreate, t.sql)
 			}
 		}
 		Expect(onlyCreate).To(HaveLen(1))
@@ -75,7 +75,7 @@ var _ = Describe("splitSQLStatements", func() {
 		sql := "CREATE TABLE e (v String) ENGINE = MergeTree"
 		statements := splitSQLStatements(sql)
 		Expect(statements).To(HaveLen(1))
-		Expect(statements[0]).To(ContainSubstring("CREATE TABLE e"))
+		Expect(statements[0].sql).To(ContainSubstring("CREATE TABLE e"))
 	})
 })
 
@@ -105,7 +105,6 @@ func splitLinesFor(stmt string) []string {
 	out = append(out, acc)
 	return out
 }
-
 
 var _ = Describe("ddlReplicaIdentity", func() {
 	It("extracts path and hostname from the macro form", func() {

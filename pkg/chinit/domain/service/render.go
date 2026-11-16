@@ -562,7 +562,7 @@ func (b *Boot) bootstrapSchema(ctx context.Context) error {
 	if b.Spec.Role == model.RoleKeeper {
 		return nil // keepers carry no tables
 	}
-	result, err := ApplyBootstrapDDL(ctx, b.Identity.Hostname)
+	result, err := ApplyBootstrapDDL(ctx, b.Identity.Hostname, string(b.Spec.Role))
 	if err != nil {
 		return err
 	}
@@ -583,13 +583,17 @@ type DDLApplyResult struct {
 	DDLPath string
 	Created int
 	Failed  int
+	// Skipped counts statements the role filter dropped (the backup's
+	// staging-pipeline objects — Code 499 AccessDenied on the queue's
+	// poll, the 2026-11-16 finding).
+	Skipped int
 }
 
 // bootstrapDDLPath and bootstrapAdminPasswordPath are the path seams
 // ApplyBootstrapDDL reads (tests redirect; production binds the
 // bundle's constants — the peerHostsPath pattern).
 var (
-	bootstrapDDLPath          = func() string { return filepath.Join(BootstrapDir, "bootstrap-ddl.sql") }
+	bootstrapDDLPath           = func() string { return filepath.Join(BootstrapDir, "bootstrap-ddl.sql") }
 	bootstrapAdminPasswordPath = func() string { return BootstrapDir + "/admin-password" }
 )
 
@@ -598,8 +602,12 @@ var (
 // Code 253 stale-znode drop-and-retry, and a failed count the caller
 // turns into a retryable error. It is the shared body of the boot's
 // bootstrap_schema step and the schema-bootstrap timer unit — the
-// heal path for a boot that lost the keeper race.
-func ApplyBootstrapDDL(ctx context.Context, hostname string) (*DDLApplyResult, error) {
+// heal path for a boot that lost the keeper race. Statements tagged
+// "-- chinit:roles=..." for OTHER roles are skipped (the staging
+// S3Queue + MV are writer/reader-only: the backup's IAM role cannot
+// list staging, and its queue instance spewed Code 499 AccessDenied —
+// the 2026-11-16 backup-0 finding).
+func ApplyBootstrapDDL(ctx context.Context, hostname, role string) (*DDLApplyResult, error) {
 	ddlPath := bootstrapDDLPath()
 	data, err := os.ReadFile(ddlPath)
 	if err != nil {
@@ -629,9 +637,18 @@ func ApplyBootstrapDDL(ctx context.Context, hostname string) (*DDLApplyResult, e
 	// and delimiter-depth-aware (semicolons inside parentheses —
 	// functions, codecs, tuples — never terminate a statement).
 	statements := splitSQLStatements(string(data))
-	for _, stmt := range statements {
-		s := strings.TrimSpace(stmt)
+	for _, tagged := range statements {
+		s := strings.TrimSpace(tagged.sql)
 		if s == "" || !strings.Contains(s, "CREATE") {
+			continue
+		}
+		// Role-scoped statements (the staging pipeline is
+		// writer/reader-only): skipped BEFORE reaching the server —
+		// a node whose IAM cannot serve the object must not
+		// materialize it (the backup's queue spewed Code 499
+		// AccessDenied on every poll, the 2026-11-16 finding).
+		if !tagged.appliesToRole(role) {
+			result.Skipped++
 			continue
 		}
 		out, err := execClient(ctx, adminPw, s)
@@ -762,11 +779,40 @@ func shardMacroValue() string {
 // signal: single quotes are not tracked because the bundle carries no
 // string literals containing semicolons or parens; a future bundle
 // needing them should extend this with a quote state.
-func splitSQLStatements(sql string) []string {
-	var statements []string
+//
+// ROLE MARKERS: a "-- chinit:roles=w,reader" comment line tags every
+// statement AFTER it until the next marker (or EOF) as belonging to
+// those roles only. The filter drops statements whose role list
+// excludes this node BEFORE they reach the server. The 2026-11-16
+// backup-0 finding: the staging S3Queue + its MV materialized on the
+// backup replica, whose IAM role is deliberately data-empty (no
+// staging ListBucket) — its queue instance spewed Code 499
+// AccessDenied on every poll cycle. An empty role list (or no marker)
+// applies to every role: the replicated tables the backup still needs.
+func splitSQLStatements(sql string) []taggedStatement {
+	var statements []taggedStatement
 	var current strings.Builder
 	depth := 0
+	appliesTo := map[string]bool{}
 	for _, line := range strings.Split(sql, "\n") {
+		// Role markers are directives, not SQL: consumed before the
+		// comment strip so "-- chinit:roles=..." on a comment line
+		// still re-tags the block that follows.
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--") {
+			// The marker tolerates comment indentation ("-- chinit:..."
+			// or "--    chinit:..."): strip the dashes and whitespace,
+			// then match the directive.
+			body := strings.TrimSpace(strings.TrimLeft(trimmed, "-"))
+			if roles := strings.TrimPrefix(body, "chinit:roles="); roles != body {
+				appliesTo = map[string]bool{}
+				for _, r := range strings.Split(roles, ",") {
+					if r = strings.TrimSpace(r); r != "" {
+						appliesTo[strings.ToLower(r)] = true
+					}
+				}
+			}
+		}
 		// Strip line comments outside parens: a "--" inside a string
 		// literal would corrupt, but the bundle's comments live at line
 		// starts and after whitespace only (the file's own convention).
@@ -783,7 +829,9 @@ func splitSQLStatements(sql string) []string {
 				}
 			case ';':
 				if depth == 0 {
-					statements = append(statements, current.String())
+					if stmt := current.String(); strings.TrimSpace(stmt) != "" {
+						statements = append(statements, taggedStatement{sql: stmt, roles: appliesTo})
+					}
 					current.Reset()
 					continue
 				}
@@ -793,9 +841,26 @@ func splitSQLStatements(sql string) []string {
 		current.WriteRune('\n')
 	}
 	if strings.TrimSpace(current.String()) != "" {
-		statements = append(statements, current.String())
+		statements = append(statements, taggedStatement{sql: current.String(), roles: appliesTo})
 	}
 	return statements
+}
+
+// taggedStatement is one DDL statement plus the roles its
+// chinit:roles marker allows (nil/empty = every role).
+type taggedStatement struct {
+	sql   string
+	roles map[string]bool
+}
+
+// appliesToRole reports whether the statement may run on this role.
+// An empty role set is the default: the statement is role-universal
+// (the replicated tables every server node needs).
+func (t taggedStatement) appliesToRole(role string) bool {
+	if len(t.roles) == 0 {
+		return true
+	}
+	return t.roles[strings.ToLower(strings.TrimSpace(role))]
 }
 
 // execClient runs one SQL statement as admin over the local client (the

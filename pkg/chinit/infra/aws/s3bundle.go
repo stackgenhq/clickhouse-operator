@@ -49,16 +49,14 @@ import (
 //     skip it via NoSuchKey) but EXCLUDED from the digest: Terraform's
 //     hash does not include it (it is a separate spec upload), and
 //     including it would make the digest role-dependent.
-//   - backup-replica-settings.xml participates in the digest AND is
-//     fetched by every role (one ~1KB file): Terraform's hash covers
-//     it inside config_files_all, so a role-skipped fetch would make
-//     the digests diverge. The static INSTALLER gates the overlay to
-//     the backup role only — fetching everywhere, installing on one.
+//   - backup-replica-settings.xml is GONE from the bundle contract
+//     (the 2026-11-16 port): the overlay renders built-in in the
+//     installer (defaultBackupOverlayXML), so no file is fetched by
+//     any role and neither side of the digest carries it.
 var bundleFiles = []bundleFile{
 	{key: "configs/network.xml", name: "network.xml", hashed: true},
 	{key: "configs/ssl.xml", name: "ssl.xml", hashed: true},
 	{key: "configs/storage.xml", name: "storage.xml", hashed: true},
-	{key: "configs/backup-replica-settings.xml", name: "backup-replica-settings.xml", hashed: true},
 	// The bootstrap DDL (the 2026-11-15 full-churn finding: the schema
 	// must ship WITH the bundle — schema-sync cannot propagate from
 	// peers when every peer churns at once). Hashed: a DDL change rolls

@@ -272,6 +272,12 @@ type StaticConfigInstaller struct {
 // the fragment top level (Code 115), and NO user-level settings
 // (Code 137). ValidateConfigSemantics gates this shape itself — the
 // built-in must pass the same rules it enforces on the bundle's copy.
+// fileExists reports whether the path names an existing regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 func defaultBackupOverlayXML() string {
 	return `<?xml version="1.0"?>
 <clickhouse>
@@ -357,36 +363,27 @@ func (i *StaticConfigInstaller) Install(ctx context.Context, bundleDir string) e
 		}
 	}
 
-	// backup-replica-settings.xml: fetched by every role (the digest
-	// covers it — Terraform hashes it as part of config_files_all), but
-	// installed ONLY on the backup replica (its MergeTree settings would
-	// disable merges on serving nodes). The installer owns the role gate
-	// because it is the only place the node's role and the config
-	// installation meet.
-	//
-	// FALLBACK: a bundle without the overlay (pre-0.2.31 bundles, or a
-	// future Terraform refactor that moves the render into the chi-spec)
-	// no longer silently loses the backup's role tuning — chinit renders
-	// the same overlay itself from the role, the 2026-11-16
-	// port-to-chinit fix. The bundle copy WINS when present (it is the
-	// tunable surface); the built-in is the floor.
+	// backup-replica-settings.xml: the backup's role overlay. The
+	// bundle contract NO LONGER carries it (the 2026-11-16 port-to-
+	// chinit): defaultBackupOverlayXML is the single source, rendered
+	// here — the installer owns the role gate because it is the only
+	// place the node's role and the config installation meet. A legacy
+	// bundle that still ships a copy keeps its content (the last
+	// bundles pre-0.2.32), validated against the same placement rules.
 	if i.Role == model.RoleBackup {
 		const brsName = "backup-replica-settings.xml"
-		src := filepath.Join(bundleDir, brsName)
-		data, err := os.ReadFile(src)
-		switch {
-		case err == nil:
-			// Validate the bundle copy against the same placement
-			// classes as any other fragment (the overlay shipped the
-			// Code 137/115/36 crash-loop shapes three times).
+		var data []byte
+		if src := filepath.Join(bundleDir, brsName); fileExists(src) {
+			b, err := os.ReadFile(src)
+			if err != nil {
+				return chinitsvc.Fatal(fmt.Errorf("read bundle config %s: %w", brsName, err))
+			}
 			if verr := ValidateXML(src); verr != nil {
 				return verr
 			}
-		case os.IsNotExist(err):
+			data = b
+		} else {
 			data = []byte(defaultBackupOverlayXML())
-			fmt.Printf("backup-replica-settings.xml: not in the bundle — rendered the built-in overlay\n")
-		default:
-			return chinitsvc.Fatal(fmt.Errorf("read bundle config %s: %w", brsName, err))
 		}
 		const dest = "/etc/clickhouse-server/config.d/backup-replica-settings.xml"
 		if err := os.WriteFile(dest, data, 0644); err != nil {

@@ -37,14 +37,13 @@ import (
 // is the on-disk staging name, hashed gates the digest membership.
 // keeper.yaml is fetched when present but EXCLUDED from the digest
 // (Terraform's hash does not include it; including it would make the
-// digest role-dependent). backup-replica-settings.xml participates in
-// the digest AND is fetched by every role — the installer gates the
-// install to the backup role.
+// digest role-dependent). backup-replica-settings.xml is GONE from the
+// bundle contract (the 2026-11-16 port): the overlay renders built-in
+// in the installer, so no file is fetched by any role.
 var bundleFiles = []bundleFile{
 	{key: "configs/network.xml", name: "network.xml", hashed: true},
 	{key: "configs/ssl.xml", name: "ssl.xml", hashed: true},
 	{key: "configs/storage.xml", name: "storage.xml", hashed: true},
-	{key: "configs/backup-replica-settings.xml", name: "backup-replica-settings.xml", hashed: true},
 	// The bootstrap DDL (the 2026-11-15 full-churn finding — schema
 	// ships with the bundle). Hashed: a DDL change rolls the fleet
 	// like any config change.
