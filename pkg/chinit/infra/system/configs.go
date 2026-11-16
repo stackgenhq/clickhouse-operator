@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
@@ -123,13 +125,85 @@ func ValidateConfigSemantics(path string, data []byte) error {
 	}
 	// Fragment roots vary (<clickhouse>, <yandex>) — validate the
 	// element's CHILDREN whatever the root name is.
-	return validateNodeChildren(path, &root)
+	if err := validateNodeChildren(path, &root); err != nil {
+		return err
+	}
+	// Cross-element semantics: the Code 36 class — a merge_tree
+	// free-entry threshold must stay UNDER the background pool size
+	// or ClickHouse 26.x refuses to start ("The value of
+	// 'number_of_free_entries_in_pool_to_execute_mutation' setting
+	// (20) ... is greater than the background pool size"). The
+	// 2026-11-16 backup-0 crash-loop round three shipped exactly
+	// this: a reduced pool (2) against the default thresholds (8/20/
+	// 25). The values can sit in the SAME fragment or the thresholds
+	// alone can ride one (the pool then lives in another fragment or
+	// config.xml — the check only fires when BOTH are visible and
+	// conflict).
+	return validatePoolThresholds(path, &root)
 }
 
-// xmlNode is a generic element: the fragment tree walk needs names
-// and nesting only, never attributes or text.
+// poolSettings carry the cross-checked pair: the background pool size
+// and the merge_tree free-entry thresholds that must stay under it.
+type poolSettings struct {
+	backgroundPoolSize int
+	thresholds         map[string]int
+}
+
+// collectPoolSettings walks the fragment for the background pool size
+// (fragment top level) and the free-entry thresholds (<merge_tree>).
+// Absent values report -1 (unknown — the check needs both).
+func collectPoolSettings(node *xmlNode, ps *poolSettings) {
+	inMergeTree := node.XMLName.Local == "merge_tree"
+	for _, child := range node.Children {
+		name := child.XMLName.Local
+		switch {
+		case name == "background_pool_size" && !inMergeTree:
+			if v, ok := childInt(&child); ok {
+				ps.backgroundPoolSize = v
+			}
+		case strings.HasPrefix(name, "number_of_free_entries_in_pool_to_") && inMergeTree:
+			if v, ok := childInt(&child); ok {
+				ps.thresholds[name] = v
+			}
+		}
+		collectPoolSettings(&child, ps)
+	}
+}
+
+// childInt parses an element's text content as an integer.
+func childInt(node *xmlNode) (int, bool) {
+	v, err := strconv.Atoi(strings.TrimSpace(node.Text))
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// validatePoolThresholds enforces floor <= pool for every visible
+// free-entry threshold against a fragment-visible pool size.
+func validatePoolThresholds(path string, root *xmlNode) error {
+	ps := poolSettings{backgroundPoolSize: -1, thresholds: map[string]int{}}
+	collectPoolSettings(root, &ps)
+	if ps.backgroundPoolSize < 0 || len(ps.thresholds) == 0 {
+		return nil // not both visible in this fragment — nothing to cross
+	}
+	for name, threshold := range ps.thresholds {
+		if threshold >= ps.backgroundPoolSize {
+			return chinitsvc.Fatal(fmt.Errorf(
+				"%s: <%s> (%d) is at or above <background_pool_size> (%d) — ClickHouse 26.x refuses to start with Code 36 "+
+					"\"is greater than the background pool size\" (the 2026-11-16 backup-0 crash-loop round three: "+
+					"a reduced pool against the default thresholds 8/20/25; scale the thresholds under the pool)",
+				path, name, threshold, ps.backgroundPoolSize))
+		}
+	}
+	return nil
+}
+
+// xmlNode is a generic element: the fragment tree walk needs names,
+// nesting, and (for the pool cross-check) leaf text.
 type xmlNode struct {
 	XMLName  xml.Name
+	Text     string    `xml:",chardata"`
 	Children []xmlNode `xml:",any"`
 }
 
@@ -188,6 +262,35 @@ type StaticConfigInstaller struct {
 }
 
 // NewStaticConfigInstaller builds the installer.
+// defaultBackupOverlayXML is the built-in backup-replica overlay — the
+// exact shape the fixed Terraform template ships, rendered by chinit
+// when the bundle carries no copy (the port-to-chinit 2026-11-16 fix:
+// the backup's role tuning no longer depends on a Terraform-rendered
+// file existing). Every value is the one the 2026-11-16 crash-loop
+// trilogy converged on: pools reduced (the backup neither merges nor
+// serves queries), thresholds scaled UNDER the pool (Code 36), pools at
+// the fragment top level (Code 115), and NO user-level settings
+// (Code 137). ValidateConfigSemantics gates this shape itself — the
+// built-in must pass the same rules it enforces on the bundle's copy.
+func defaultBackupOverlayXML() string {
+	return `<?xml version="1.0"?>
+<clickhouse>
+    <merge_tree>
+        <always_fetch_merged_part>1</always_fetch_merged_part>
+        <replicated_can_become_leader>0</replicated_can_become_leader>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>1</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_mutation>1</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>1</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+    <background_pool_size>2</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio>
+    <background_move_pool_size>2</background_move_pool_size>
+    <background_fetches_pool_size>4</background_fetches_pool_size>
+    <background_schedule_pool_size>2</background_schedule_pool_size>
+</clickhouse>
+`
+}
+
 func NewStaticConfigInstaller(runner Runner) *StaticConfigInstaller {
 	return &StaticConfigInstaller{runner: runner}
 }
@@ -260,14 +363,29 @@ func (i *StaticConfigInstaller) Install(ctx context.Context, bundleDir string) e
 	// disable merges on serving nodes). The installer owns the role gate
 	// because it is the only place the node's role and the config
 	// installation meet.
+	//
+	// FALLBACK: a bundle without the overlay (pre-0.2.31 bundles, or a
+	// future Terraform refactor that moves the render into the chi-spec)
+	// no longer silently loses the backup's role tuning — chinit renders
+	// the same overlay itself from the role, the 2026-11-16
+	// port-to-chinit fix. The bundle copy WINS when present (it is the
+	// tunable surface); the built-in is the floor.
 	if i.Role == model.RoleBackup {
 		const brsName = "backup-replica-settings.xml"
 		src := filepath.Join(bundleDir, brsName)
-		if err := ValidateXML(src); err != nil {
-			return err
-		}
 		data, err := os.ReadFile(src)
-		if err != nil {
+		switch {
+		case err == nil:
+			// Validate the bundle copy against the same placement
+			// classes as any other fragment (the overlay shipped the
+			// Code 137/115/36 crash-loop shapes three times).
+			if verr := ValidateXML(src); verr != nil {
+				return verr
+			}
+		case os.IsNotExist(err):
+			data = []byte(defaultBackupOverlayXML())
+			fmt.Printf("backup-replica-settings.xml: not in the bundle — rendered the built-in overlay\n")
+		default:
 			return chinitsvc.Fatal(fmt.Errorf("read bundle config %s: %w", brsName, err))
 		}
 		const dest = "/etc/clickhouse-server/config.d/backup-replica-settings.xml"
