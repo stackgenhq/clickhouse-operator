@@ -702,6 +702,35 @@ func runLeaseRenew(args []string) error {
 		if err := service.ConvergePeerDNS(ctx, provider, dnsArgs); err != nil {
 			slog.Warn("lease-renew: peer-dns convergence failed", "err", err)
 		}
+
+		// remote_servers convergence on the same tick: the rendered
+		// inventory is the LIST half of the residue healing (hosts +
+		// DNS heal the RESOLUTION; this heals the membership). Same
+		// best-effort contract — a failure keeps the current file
+		// and the next tick retries. Server nodes only (keepers
+		// render no CHI section; backup is excluded above).
+		if st.Identity.Role != model.RoleKeeper && st.Identity.Role != model.RoleBackup {
+			if spec, err := loadSpec(inventorySpecPath()); err == nil {
+				boot := &service.Boot{
+					Spec:     spec,
+					Provider: provider,
+					Meta: port.InstanceMetadata{
+						Provider:   provider.Name(),
+						Region:    st.Identity.Region,
+						InstanceID: st.Identity.InstanceID,
+						PrivateIP:  st.Identity.PrivateIP,
+					},
+					Identity: st.Identity,
+					// StatePath stays empty: the convergence renders
+					// CONTENT only — it never touches the state store.
+				}
+				if err := boot.ConvergeRemoteServers(ctx); err != nil {
+					slog.Warn("lease-renew: remote-servers convergence failed", "err", err)
+				}
+			} else {
+				slog.Warn("lease-renew: spec unreadable; remote-servers convergence skipped", "err", err)
+			}
+		}
 	}
 	return nil
 }
