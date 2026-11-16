@@ -30,10 +30,6 @@ import (
 
 // Paths the boot pipeline owns (mirrors the bash script's constants).
 const (
-	// BootstrapDir is where the fetched bundle lands (and where chinit
-	// writes node-env for legacy consumers during migration).
-	BootstrapDir = "/var/lib/clickhouse-bootstrap"
-
 	// ConfigD / UsersD are the ClickHouse drop directories.
 	ConfigDir = "/etc/clickhouse-server/config.d"
 	UsersDir  = "/etc/clickhouse-server/users.d"
@@ -44,11 +40,17 @@ const (
 	// NodeEnvPath is the shell identity contract for unit scripts that
 	// still source it (kept until every consumer is a chinit
 	// subcommand).
-	NodeEnvPath = BootstrapDir + "/node-env"
+	NodeEnvPath = "/var/lib/clickhouse-bootstrap/node-env"
 
 	// BootFinishedMarker is what health verification greps for.
 	BootFinishedMarker = "/var/lib/cloud/instance/boot-finished"
 )
+
+// BootstrapDir is where the fetched bundle lands (and where chinit
+// writes node-env for legacy consumers during migration). A var (not
+// part of the const block) so tests can redirect it — the
+// bootstrapDDLPath/bootstrapAdminPasswordPath seam pattern.
+var BootstrapDir = "/var/lib/clickhouse-bootstrap"
 
 // Boot is one node's boot pipeline: spec + provider + host. The 19-step
 // order encodes the production findings the bash script's comments
